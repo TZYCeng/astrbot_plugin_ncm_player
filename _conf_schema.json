@@ -1,0 +1,114 @@
+{
+    "ncm_api_base": {
+        "description": "NeteaseCloudMusicApi 服务地址（可选）",
+        "hint": "自建或公共的 NeteaseCloudMusicApi 服务根地址，如 http://127.0.0.1:3000。配置后优先用它取播放地址，且支持 /网易云登录 扫码登录解锁无损/母带音质。部署见 https://github.com/neteasecloudmusicapienhanced/api-enhanced",
+        "type": "string",
+        "default": ""
+    },
+    "meting_api": {
+        "description": "Meting 镜像地址",
+        "hint": "官方接口失效时的备用音频来源（音质不可控）。默认公共镜像，可换成自建 MetingAPI；留空则禁用",
+        "type": "string",
+        "default": "https://api.qijieya.cn/meting/"
+    },
+    "quality": {
+        "description": "期望音质档位",
+        "hint": "standard=标准128k, higher=较高192k, exhigh=极高320k, lossless=无损FLAC, hires=高清臻音, jymaster=超清母带。取不到时自动逐级回退；无损及以上需扫码登录会员账号",
+        "type": "string",
+        "options": [
+            "standard",
+            "higher",
+            "exhigh",
+            "lossless",
+            "hires",
+            "jymaster"
+        ],
+        "default": "exhigh"
+    },
+    "load_mode": {
+        "description": "语音载入方式",
+        "hint": "file=本地文件路径发送（要求 AstrBot 与 NapCat/协议端同机，推荐，WebSocket 上只传路径）；url=把音频直链交给协议端下载（适合协议端在另一台机器，此模式下不会本地下载）；base64=编码内嵌进消息（大文件会撑爆 WebSocket，慎用）",
+        "type": "string",
+        "options": [
+            "file",
+            "url",
+            "base64"
+        ],
+        "default": "file"
+    },
+    "send_mode": {
+        "description": "发送方式组合",
+        "hint": "auto=语音优先失败自动降级；voice/file/card=只发对应方式；voice_card、voice_file、file_card、voice_file_card=多种一起发。全部失败时以链接保底",
+        "type": "string",
+        "options": [
+            "auto",
+            "voice",
+            "file",
+            "card",
+            "voice_card",
+            "voice_file",
+            "file_card",
+            "voice_file_card"
+        ],
+        "default": "auto"
+    },
+    "enable_keyword_listen": {
+        "description": "关键词监听点歌",
+        "hint": "监听「我想听/我要听/点歌/来一首/播放」等口语化消息，不经过 LLM 直接搜歌发选歌图；选歌图发出后回复纯数字序号即可播放。误触发较多时可关闭",
+        "type": "bool",
+        "default": true
+    },
+    "send_play_card": {
+        "description": "发送播放卡片图",
+        "hint": "点歌成功时发送 CD 风格的封面卡片图",
+        "type": "bool",
+        "default": true
+    },
+    "send_comment_card": {
+        "description": "发送热评卡片",
+        "hint": "点歌后嗅探一条最热评论，渲染成卡片图随歌曲一起发送",
+        "type": "bool",
+        "default": true
+    },
+    "send_lyrics_forward": {
+        "description": "发送歌词合并转发",
+        "hint": "点歌后嗅探整首歌词，以合并转发（聊天记录）形式发送；纯音乐无歌词时自动跳过",
+        "type": "bool",
+        "default": true
+    },
+    "send_timeout": {
+        "description": "单级发送超时（秒）",
+        "hint": "每种发送方式的最长等待时间，超时视为失败进入下一级。注意 AstrBot 的 LLM 工具总超时默认 60 秒，此项不宜过大",
+        "type": "int",
+        "default": 20
+    },
+    "download_timeout": {
+        "description": "音频下载超时（秒）",
+        "hint": "下载歌曲文件的最长等待时间",
+        "type": "int",
+        "default": 20
+    },
+    "download_max_mb": {
+        "description": "下载大小上限（MB）",
+        "hint": "超过该大小的歌曲不下载，直接降级为音乐卡片/链接。无损/母带文件通常 30-100MB，想用高音质请调大",
+        "type": "int",
+        "default": 40
+    },
+    "search_limit": {
+        "description": "选歌列表数量",
+        "hint": "搜索后展示给用户挑选的歌曲数量",
+        "type": "int",
+        "slider": {
+            "min": 3,
+            "max": 10,
+            "step": 1
+        },
+        "default": 5
+    },
+    "http_proxy": {
+        "description": "HTTP 代理",
+        "hint": "访问网易云接口使用的代理，如 http://127.0.0.1:7890，不需要则留空",
+        "type": "string",
+        "default": ""
+    }
+}
