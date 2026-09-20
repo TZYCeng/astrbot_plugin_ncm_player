@@ -26,7 +26,7 @@ LISTEN_PATTERN = "(" + "|".join(LISTEN_TRIGGERS) + ")"
     "astrbot_plugin_ncm_player",
     "Kimi",
     "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码登录",
-    "1.2.0",
+    "1.2.1",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -291,7 +291,7 @@ class NcmPlayerPlugin(Star):
         event.stop_event()
         self.pending.pop(event.unified_msg_origin, None)
         result = await self._play(event, songs[idx - 1])
-        await event.send(event.plain_result(f"✅ {result}"))
+        logger.info(f"[ncm_player] 点歌完成：{result}")
 
     # ---------- 指令 ----------
 
@@ -320,7 +320,7 @@ class NcmPlayerPlugin(Star):
                 )
                 return
             result = await self._play(ev, songs[int(text) - 1])
-            await ev.send(ev.plain_result(f"✅ {result}"))
+            logger.info(f"[ncm_player] 点歌完成：{result}")
             controller.stop()
 
         try:
@@ -346,7 +346,8 @@ class NcmPlayerPlugin(Star):
             yield event.plain_result(f"没有找到「{keyword}」相关的歌曲")
             return
         result = await self._play(event, songs[0])
-        yield event.plain_result(f"✅ {result}")
+        logger.info(f"[ncm_player] 点歌完成：{result}")
+        return
 
     @filter.command("网易云登录")
     async def cmd_login(self, event: AstrMessageEvent):
