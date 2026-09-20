@@ -118,9 +118,10 @@ def _load_square(img_bytes: bytes | None, size: int, fallback=(226, 230, 238)) -
 
 
 def _make_disc(cover_bytes: bytes | None, size: int, hole_ratio: float = 0.045) -> Image.Image:
-    """把封面渲染成一张 CD 光盘：圆形盘面 + 彩虹光泽 + 黑色盘毂 + 中心孔"""
+    """把封面渲染成一张 CD 光盘：圆形盘面 + 彩虹光泽 + 模糊盘心 + 中心孔"""
     S = size
-    disc = _load_square(cover_bytes, S).convert("RGBA")
+    base = _load_square(cover_bytes, S)
+    disc = base.convert("RGBA")
 
     # 轻微压暗盘面，让光泽更明显
     dim = Image.new("RGBA", (S, S), (0, 0, 0, 28))
@@ -149,11 +150,18 @@ def _make_disc(cover_bytes: bytes | None, size: int, hole_ratio: float = 0.045) 
     cx = S / 2
     # 外缘细环
     draw.ellipse((1, 1, S - 1, S - 1), outline=(255, 255, 255, 90), width=2)
-    # 盘毂黑环
-    hub_r = S * 0.17
-    draw.ellipse((cx - hub_r, cx - hub_r, cx + hub_r, cx + hub_r), fill=(18, 18, 22, 235))
+    # 盘毂：取封面中心区域高斯模糊 + 轻压暗，而非纯黑
+    hub_r = S * 0.19
+    hub_d = int(hub_r * 2)
+    c0 = int(cx - hub_r)
+    hub = base.crop((c0, c0, c0 + hub_d, c0 + hub_d))
+    hub = hub.filter(ImageFilter.GaussianBlur(max(2, S // 60))).convert("RGBA")
+    hub = Image.alpha_composite(hub, Image.new("RGBA", (hub_d, hub_d), (0, 0, 0, 80)))
+    hub_mask = Image.new("L", (hub_d, hub_d), 0)
+    ImageDraw.Draw(hub_mask).ellipse((0, 0, hub_d, hub_d), fill=255)
+    disc.paste(hub, (c0, c0), hub_mask)
     # 毂环高光线
-    for rr, alpha in ((hub_r, 110), (hub_r * 0.72, 60)):
+    for rr, alpha in ((hub_r, 130), (hub_r * 0.72, 70)):
         draw.ellipse((cx - rr, cx - rr, cx + rr, cx + rr), outline=(255, 255, 255, alpha), width=2)
     # 银色内圈
     sil_r = S * 0.075
@@ -268,13 +276,14 @@ class CardRenderer:
         f_tag = _load_font(19, bold=True)
         f_brand = _load_font(20, bold=True)
 
-        # 大 CD（带投影）
-        disc_size = H - pad * 2
+        # 大 CD（带投影），盘面缩小并垂直居中
+        disc_size = int((H - pad * 2) * 0.82)
         disc = _make_disc(cover, disc_size)
-        _paste_shadow(bg, disc, (pad, pad))
+        disc_y = (H - disc_size) // 2
+        _paste_shadow(bg, disc, (pad + 12, disc_y))
 
         # 右侧信息区
-        tx = pad + disc_size + 44
+        tx = pad + 12 + disc_size + 44
         max_tw = W - tx - pad
         draw.rounded_rectangle((tx, pad + 20, tx + 8, pad + 20 + 44), 4, fill=ACCENT)
         draw.text(
