@@ -10,7 +10,8 @@ from astrbot.api.message_components import Image, Node, Nodes, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
-from .core.ncm_api import QUALITY_LEVELS, NetEaseAPI, PlayInfo, Song
+from .core.ncm_api import NetEaseAPI, PlayInfo, Song, normalize_quality
+from .core.ncm_server import EmbeddedNcmServer
 from .core.renderer import CardRenderer
 from .core.sender import SongSender
 
@@ -25,8 +26,8 @@ LISTEN_PATTERN = "(" + "|".join(LISTEN_TRIGGERS) + ")"
 @register(
     "astrbot_plugin_ncm_player",
     "Kimi",
-    "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码登录",
-    "1.2.2",
+    "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码登录、内置 NeteaseCloudMusicApi 服务",
+    "1.3.0",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -51,8 +52,41 @@ class NcmPlayerPlugin(Star):
         self.sender = SongSender(self.cfg)
         # unified_msg_origin -> (时间戳, 候选歌曲)
         self.pending: dict[str, tuple[float, list[Song]]] = {}
+        # 内置 NeteaseCloudMusicApi 服务（默认关闭：不下载、不启动进程）
+        self.embedded: EmbeddedNcmServer | None = None
+        if self.cfg.get("ncm_api_embedded", False):
+            self.embedded = EmbeddedNcmServer(
+                self.data_dir,
+                port=int(self.cfg.get("ncm_api_embedded_port", 13000)),
+                proxy=self.cfg.get("http_proxy", ""),
+                mirror=self.cfg.get("ncm_api_embedded_mirror", ""),
+            )
+
+    async def initialize(self):
+        """插件加载后钩子：按需启动内置服务并校验登录状态"""
+        if self.embedded:
+            try:
+                base = await self.embedded.start()
+                # 内置服务就绪后优先生效（本机服务，音质可控、支持扫码登录）
+                self.api.ncm_api_base = base
+                logger.info(f"[ncm_player] 已切换到内置 NeteaseCloudMusicApi: {base}")
+            except Exception as e:
+                logger.error(
+                    f"[ncm_player] 内置 NeteaseCloudMusicApi 启动失败，"
+                    f"回退到既有音源链路: {e}"
+                )
+        if self.api.ncm_api_base and self.api.cookie:
+            if await self.api.check_login():
+                logger.info("[ncm_player] 检测到已登录的网易云账号，会员音质可用")
+            else:
+                logger.warning(
+                    "[ncm_player] 本地 cookie 已失效或未登录，"
+                    "无损及以上音质不可用，可使用 /网易云登录 重新扫码"
+                )
 
     async def terminate(self):
+        if self.embedded:
+            await self.embedded.stop()
         await self.api.close()
 
     # ---------- 内部流程 ----------
@@ -149,9 +183,7 @@ class NcmPlayerPlugin(Star):
 
     async def _play(self, event: AstrMessageEvent, song: Song) -> str:
         """取播放地址 → 下载（如需）→ 播放卡片 → 发送 → 热评/歌词。返回结果描述"""
-        quality = str(self.cfg.get("quality", "exhigh"))
-        if quality not in QUALITY_LEVELS:
-            quality = "exhigh"
+        quality = normalize_quality(self.cfg.get("quality", "exhigh"))
         play = await self.api.get_play_info(song.id, quality)
         if not play or not play.url:
             return f"未能获取《{song.name}》的播放地址（可能为 VIP/无版权歌曲）"
@@ -354,7 +386,8 @@ class NcmPlayerPlugin(Star):
         """生成网易云登录二维码，用网易云音乐 App 扫码登录，解锁无损/母带音质"""
         if not self.api.ncm_api_base:
             yield event.plain_result(
-                "请先在插件配置中填写 ncm_api_base（NeteaseCloudMusicApi 服务地址），再使用本命令登录"
+                "请先在插件配置中开启「内置 NeteaseCloudMusicApi 服务」"
+                "或填写 ncm_api_base（外部服务地址），再使用本命令登录"
             )
             return
         try:
@@ -381,20 +414,27 @@ class NcmPlayerPlugin(Star):
             yield event.plain_result(f"二维码解析失败：{e}")
             return
 
-        for _ in range(60):
-            await asyncio.sleep(3)
+        confirmed = False
+        for _ in range(120):  # 每 1.5 秒轮询一次，共 3 分钟
+            await asyncio.sleep(1.5)
             try:
                 code, cookie = await self.api.qr_check(key)
             except Exception as e:
                 logger.warning(f"[ncm_player] 扫码状态查询失败: {e}")
                 continue
             if code == 803:
-                self.api.set_cookie(cookie)
-                self.cookie_file.write_text(cookie, encoding="utf-8")
+                if cookie:
+                    self.api.set_cookie(cookie)
+                    self.cookie_file.write_text(cookie, encoding="utf-8")
                 await event.send(
                     event.plain_result("✅ 网易云登录成功，已解锁会员音质")
                 )
                 return
+            if code == 802 and not confirmed:
+                confirmed = True
+                await event.send(
+                    event.plain_result("扫码成功，请在网易云音乐 App 上点击确认登录")
+                )
             if code == 800:
                 await event.send(event.plain_result("二维码已过期，请重新发起登录"))
                 return
