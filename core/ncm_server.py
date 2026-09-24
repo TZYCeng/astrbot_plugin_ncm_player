@@ -38,7 +38,14 @@ _ASSETS = {
     ("windows", "x86_64"): "ncm-api-win-x64.exe",
 }
 
-_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=600, connect=15, sock_read=60)
+_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=3600, connect=15, sock_read=60)
+
+# 未配置 ncm_api_embedded_mirror 时的下载源候选：先直连，失败后换加速镜像
+_MIRROR_CANDIDATES = [
+    "",
+    "https://ghfast.top/",
+    "https://gh-proxy.com/",
+]
 
 
 class EmbeddedNcmServer:
@@ -79,36 +86,86 @@ class EmbeddedNcmServer:
     def bin_path(self) -> Path:
         return self.dir / self._asset_name()
 
-    def _download_url(self) -> str:
-        url = f"{RELEASE_BASE}/{self._asset_name()}"
-        return f"{self.mirror}{url}" if self.mirror else url
-
     # ---------- 下载 ----------
 
     async def ensure_binary(self):
-        """二进制不存在则下载（约 70MB）。下载到 .part 完成后改名，避免半成品"""
+        """二进制不存在则下载（约 70MB）。
+
+        - 依次尝试：用户配置的镜像 → 直连 GitHub → 内置加速镜像；
+        - 每个源失败自动换源，同一源最多试 2 次；
+        - 下载到 .part 支持断点续传，完成后改名，避免半成品。
+        """
         path = self.bin_path
         if path.exists() and path.stat().st_size > 1024 * 1024:
             return
         self.dir.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".part")
-        url = self._download_url()
-        logger.info(f"[ncm_player] 开始下载内置 NeteaseCloudMusicApi 服务: {url}")
+        base = f"{RELEASE_BASE}/{self._asset_name()}"
+        mirrors = [self.mirror] if self.mirror else list(_MIRROR_CANDIDATES)
+
+        last_err: Exception | None = None
+        for mirror in mirrors:
+            url = f"{mirror}{base}" if mirror else base
+            for attempt in range(2):
+                try:
+                    await self._download(url, tmp)
+                    tmp.rename(path)
+                    # 赋予执行权限（Windows 忽略）
+                    try:
+                        path.chmod(
+                            path.stat().st_mode
+                            | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+                        )
+                    except Exception:
+                        pass
+                    logger.info(f"[ncm_player] 内置服务下载完成: {path}")
+                    return
+                except Exception as e:
+                    last_err = e
+                    logger.warning(
+                        f"[ncm_player] 内置服务下载失败"
+                        f"（{'直连' if not mirror else mirror}，第 {attempt + 1} 次）: {e}"
+                    )
+                    await asyncio.sleep(2)
+        raise RuntimeError(
+            f"内置服务下载失败，所有下载源均不可用: {last_err}。"
+            "可在插件配置 ncm_api_embedded_mirror 填写其他加速前缀，"
+            "或配置 http_proxy 后重试"
+        )
+
+    async def _download(self, url: str, tmp: Path):
+        """下载到 .part，已存在部分时带 Range 断点续传，并定期打印进度"""
+        offset = tmp.stat().st_size if tmp.exists() else 0
+        headers = {"Range": f"bytes={offset}-"} if offset else {}
+        logger.info(
+            f"[ncm_player] 开始下载内置 NeteaseCloudMusicApi 服务: {url}"
+            + (f"（从 {offset / 1024 / 1024:.1f}MB 续传）" if offset else "")
+        )
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                url, proxy=self.proxy, timeout=_DOWNLOAD_TIMEOUT
+                url, proxy=self.proxy, headers=headers, timeout=_DOWNLOAD_TIMEOUT
             ) as resp:
-                resp.raise_for_status()
-                with open(tmp, "wb") as f:
+                if resp.status not in (200, 206):
+                    raise RuntimeError(f"HTTP {resp.status}")
+                # 服务器忽略 Range 返回 200 时从头重写
+                mode = "ab" if (offset and resp.status == 206) else "wb"
+                written = offset if mode == "ab" else 0
+                total = (resp.content_length or 0) + (offset if mode == "ab" else 0)
+                next_log = 0
+                with open(tmp, mode) as f:
                     async for chunk in resp.content.iter_chunked(1 << 20):
                         f.write(chunk)
-        tmp.rename(path)
-        # 赋予执行权限（Windows 忽略）
-        try:
-            path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        except Exception:
-            pass
-        logger.info(f"[ncm_player] 内置服务下载完成: {path}")
+                        written += len(chunk)
+                        mb = written / 1024 / 1024
+                        if mb >= next_log:
+                            next_log = mb + 10
+                            if total:
+                                logger.info(
+                                    f"[ncm_player] 内置服务下载进度: "
+                                    f"{mb:.0f}/{total / 1024 / 1024:.0f}MB"
+                                )
+                if written < 1024 * 1024:
+                    raise RuntimeError(f"下载内容异常（仅 {written} 字节）")
 
     # ---------- 进程管理 ----------
 
@@ -137,7 +194,7 @@ class EmbeddedNcmServer:
         await self._wait_ready()
         return self.base_url
 
-    async def _wait_ready(self, timeout: int = 45):
+    async def _wait_ready(self, timeout: int = 60):
         """健康检查：等待服务可连接"""
         async with aiohttp.ClientSession() as session:
             for _ in range(timeout):
