@@ -7,7 +7,9 @@
 4. 网易云官方外链兜底
 """
 
+import asyncio
 import re
+import time
 from dataclasses import dataclass
 
 import aiohttp
@@ -25,6 +27,22 @@ QUALITY_LEVELS: dict[str, tuple[str, int, str]] = {
 }
 # 取不到期望档位时的回退顺序
 LEVEL_FALLBACK = ["exhigh", "higher", "standard"]
+
+# 配置值别名：中文档位名 / 旧版英文 key -> 内部 key
+QUALITY_ALIASES: dict[str, str] = {
+    "标准 128k": "standard",
+    "较高 192k": "higher",
+    "极高 320k": "exhigh",
+    "无损 FLAC": "lossless",
+    "高清臻音 Hi-Res": "hires",
+    "超清母带": "jymaster",
+    **{k: k for k in QUALITY_LEVELS},
+}
+
+
+def normalize_quality(value: str) -> str:
+    """把配置里的音质值（中文档位名或旧版英文 key）归一化为内部 key"""
+    return QUALITY_ALIASES.get(str(value).strip(), "exhigh")
 
 
 @dataclass
@@ -282,10 +300,16 @@ class NetEaseAPI:
 
     # ---------- 二维码登录（依赖 NeteaseCloudMusicApi 服务） ----------
 
+    @staticmethod
+    def _ts() -> int:
+        """毫秒时间戳。服务端 apicache 以完整 URL 为缓存键，
+        旧版固定 timestamp=0 会导致扫码状态被缓存，迟迟查不到登录成功"""
+        return int(time.time() * 1000)
+
     async def qr_key(self) -> str:
         result = await self._get(
             f"{self.ncm_api_base}/login/qr/key",
-            params={"timestamp": 0},
+            params={"timestamp": self._ts()},
         )
         return (result.get("data") or {})["unikey"]
 
@@ -293,18 +317,46 @@ class NetEaseAPI:
         """返回二维码图片的 base64 data-uri"""
         result = await self._get(
             f"{self.ncm_api_base}/login/qr/create",
-            params={"key": key, "qrimg": "true", "timestamp": 0},
+            params={"key": key, "qrimg": "true", "timestamp": self._ts()},
         )
         return (result.get("data") or {})["qrimg"]
 
     async def qr_check(self, key: str) -> tuple[int, str]:
-        """轮询扫码状态。返回 (code, cookie)。800 过期 801 等待 802 待确认 803 成功"""
-        result = await self._get(
+        """轮询扫码状态。返回 (code, cookie)。800 过期 801 等待 802 待确认 803 成功。
+
+        cookie 优先取响应体；部分版本只在 Set-Cookie 响应头里返回，做兜底合并，
+        避免登录成功却拿到空 cookie（表现为重启/刷新后"掉登录"）。
+        """
+        async with self.session.get(
             f"{self.ncm_api_base}/login/qr/check",
-            auth=True,
-            params={"key": key, "timestamp": 0},
-        )
-        return int(result.get("code", 0)), result.get("cookie", "")
+            proxy=self.proxy,
+            headers=self._auth_headers(),
+            params={"key": key, "timestamp": self._ts()},
+        ) as resp:
+            resp.raise_for_status()
+            result = await resp.json(content_type=None)
+            cookie = result.get("cookie", "") or ""
+            if not cookie:
+                raw = resp.headers.getall("Set-Cookie", [])
+                pairs = [c.split(";", 1)[0] for c in raw if "=" in c.split(";", 1)[0]]
+                cookie = "; ".join(pairs)
+            return int(result.get("code", 0)), cookie
+
+    async def check_login(self) -> bool:
+        """校验当前 cookie 是否仍有效（用于启动时提示登录状态）"""
+        if not self.ncm_api_base or not self.cookie:
+            return False
+        try:
+            result = await self._get(
+                f"{self.ncm_api_base}/login/status",
+                auth=True,
+                params={"timestamp": self._ts()},
+            )
+            account = (result.get("data") or {}).get("account")
+            return bool(account and account.get("id"))
+        except Exception as e:
+            logger.warning(f"[ncm_player] 登录状态校验失败: {e}")
+            return False
 
     # ---------- 下载 ----------
 
@@ -321,27 +373,47 @@ class NetEaseAPI:
             return None
 
     async def download(self, url: str, dest: str, max_mb: int, timeout: int) -> int:
-        """流式下载音频到本地，超限即中止。返回实际字节数"""
+        """流式下载音频到本地，超限即中止，失败自动重试一次。返回实际字节数。
+
+        timeout 语义为「停滞超时」（sock_read）：只要数据持续到达就不判超时，
+        避免旧版 total 总超时把网速慢但正常下载的大文件（无损/母带）掐死。
+        """
         limit = max_mb * 1024 * 1024
-        written = 0
-        async with self.session.get(
-            url, proxy=self.proxy, timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as resp:
-            resp.raise_for_status()
-            ctype = (resp.content_type or "").lower()
-            if ctype and not (
-                ctype.startswith("audio") or ctype == "application/octet-stream"
-            ):
-                raise ValueError(f"返回的不是音频(content-type={ctype})，歌曲可能不可用")
-            length = resp.content_length or 0
-            if length and length > limit:
-                raise ValueError(
-                    f"文件 {length / 1024 / 1024:.1f}MB 超过上限 {max_mb}MB"
-                )
-            with open(dest, "wb") as f:
-                async for chunk in resp.content.iter_chunked(65536):
-                    written += len(chunk)
-                    if written > limit:
-                        raise ValueError(f"文件超过下载上限 {max_mb}MB")
-                    f.write(chunk)
-        return written
+        last_err: Exception | None = None
+        for attempt in range(2):
+            written = 0
+            try:
+                async with self.session.get(
+                    url,
+                    proxy=self.proxy,
+                    timeout=aiohttp.ClientTimeout(
+                        total=None, connect=10, sock_connect=10, sock_read=timeout
+                    ),
+                ) as resp:
+                    resp.raise_for_status()
+                    ctype = (resp.content_type or "").lower()
+                    if ctype and not (
+                        ctype.startswith("audio")
+                        or ctype == "application/octet-stream"
+                    ):
+                        raise ValueError(
+                            f"返回的不是音频(content-type={ctype})，歌曲可能不可用"
+                        )
+                    length = resp.content_length or 0
+                    if length and length > limit:
+                        raise ValueError(
+                            f"文件 {length / 1024 / 1024:.1f}MB 超过上限 {max_mb}MB"
+                        )
+                    with open(dest, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(65536):
+                            written += len(chunk)
+                            if written > limit:
+                                raise ValueError(f"文件超过下载上限 {max_mb}MB")
+                            f.write(chunk)
+                return written
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    logger.warning(f"[ncm_player] 下载失败，3 秒后重试: {e}")
+                    await asyncio.sleep(3)
+        raise last_err
