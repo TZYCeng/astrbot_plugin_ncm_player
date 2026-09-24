@@ -27,7 +27,7 @@ LISTEN_PATTERN = "(" + "|".join(LISTEN_TRIGGERS) + ")"
     "astrbot_plugin_ncm_player",
     "Kimi",
     "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码登录、内置 NeteaseCloudMusicApi 服务",
-    "1.3.1",
+    "1.4.0",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -52,7 +52,7 @@ class NcmPlayerPlugin(Star):
         self.sender = SongSender(self.cfg)
         # unified_msg_origin -> (时间戳, 候选歌曲)
         self.pending: dict[str, tuple[float, list[Song]]] = {}
-        # 内置 NeteaseCloudMusicApi 服务（默认关闭：不下载、不启动进程）
+        # 内置 NeteaseCloudMusicApi 服务（默认关闭：不启动进程）
         self.embedded: EmbeddedNcmServer | None = None
         if self.cfg.get("ncm_api_embedded", False):
             self.embedded = EmbeddedNcmServer(
@@ -63,7 +63,15 @@ class NcmPlayerPlugin(Star):
             )
 
     async def initialize(self):
-        """插件加载后钩子：按需启动内置服务并校验登录状态"""
+        """插件加载后钩子。
+
+        内置服务启动与登录状态校验全部放入后台任务，绝不阻塞 AstrBot 启动流程
+        （同步等待二进制下载/健康检查曾导致插件重载卡住、AstrBot 无法重启）。
+        """
+        self._bg_task = asyncio.create_task(self._init_background())
+
+    async def _init_background(self):
+        """后台初始化：按需启动内置服务并校验登录状态"""
         if self.embedded:
             try:
                 base = await self.embedded.start()
@@ -85,6 +93,9 @@ class NcmPlayerPlugin(Star):
                 )
 
     async def terminate(self):
+        task = getattr(self, "_bg_task", None)
+        if task and not task.done():
+            task.cancel()
         if self.embedded:
             await self.embedded.stop()
         await self.api.close()
