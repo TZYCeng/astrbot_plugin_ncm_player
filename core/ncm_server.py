@@ -14,6 +14,7 @@ https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/releases
 
 import asyncio
 import platform
+import shutil
 import stat
 from pathlib import Path
 
@@ -178,6 +179,19 @@ class EmbeddedNcmServer:
 
     # ---------- 进程管理 ----------
 
+    def _ensure_executable(self) -> Path:
+        """把二进制复制到可写的数据目录并赋予执行权限，返回可执行路径。
+
+        插件目录（zip 安装 / 只读挂载）里的文件通常没有执行权限，
+        直接运行会 Permission denied，因此统一复制到数据目录执行。
+        """
+        src = self.bin_path
+        dst = self.dir / src.name
+        if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+            shutil.copy2(str(src), str(dst))
+        dst.chmod(0o755)
+        return dst
+
     async def start(self) -> str:
         """确保二进制就绪并启动服务，返回服务地址。失败抛异常"""
         await self.ensure_binary()
@@ -185,13 +199,14 @@ class EmbeddedNcmServer:
             return self.base_url  # 已在运行
 
         self.dir.mkdir(parents=True, exist_ok=True)  # 作为进程工作目录
+        exe = self._ensure_executable()
         env = {
             "PATH": "/usr/bin:/bin:/usr/local/bin",
             "PORT": str(self.port),
             "HOST": "127.0.0.1",
         }
         self.process = await asyncio.create_subprocess_exec(
-            str(self.bin_path),
+            str(exe),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=env,
