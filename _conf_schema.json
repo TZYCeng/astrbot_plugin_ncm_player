@@ -1,7 +1,25 @@
 {
+    "ncm_api_embedded": {
+        "description": "内置 NeteaseCloudMusicApi 服务",
+        "hint": "开启后插件在（重）启动时自动下载官方 release 预编译服务（约 70MB，MIT 许可）并在本机运行，无需自己部署 Node 服务即可扫码登录、解锁无损/母带音质。默认关闭：不下载、不运行任何进程。开启后需重载插件/重启 AstrBot 生效",
+        "type": "bool",
+        "default": false
+    },
+    "ncm_api_embedded_port": {
+        "description": "内置服务端口",
+        "hint": "内置 NeteaseCloudMusicApi 监听的本机端口，仅 127.0.0.1 可访问。与已有服务冲突时再修改",
+        "type": "int",
+        "default": 13000
+    },
+    "ncm_api_embedded_mirror": {
+        "description": "内置服务下载镜像前缀",
+        "hint": "服务器访问 GitHub 困难时填写加速前缀，如 https://ghfast.top/ ；留空则直连 GitHub。可复用 http_proxy 代理",
+        "type": "string",
+        "default": ""
+    },
     "ncm_api_base": {
-        "description": "NeteaseCloudMusicApi 服务地址（可选）",
-        "hint": "自建或公共的 NeteaseCloudMusicApi 服务根地址，如 http://127.0.0.1:3000。配置后优先用它取播放地址，且支持 /网易云登录 扫码登录解锁无损/母带音质。部署见 https://github.com/neteasecloudmusicapienhanced/api-enhanced",
+        "description": "外部 NeteaseCloudMusicApi 服务地址（可选）",
+        "hint": "自己部署的 NeteaseCloudMusicApi 服务根地址，如 http://127.0.0.1:3000。开启「内置服务」后本项被忽略；未开启时配置本项同样支持扫码登录与母带级音质。部署见 https://github.com/neteasecloudmusicapienhanced/api-enhanced",
         "type": "string",
         "default": ""
     },
@@ -13,17 +31,17 @@
     },
     "quality": {
         "description": "期望音质档位",
-        "hint": "standard=标准128k, higher=较高192k, exhigh=极高320k, lossless=无损FLAC, hires=高清臻音, jymaster=超清母带。取不到时自动逐级回退；无损及以上需扫码登录会员账号",
+        "hint": "取不到所选档位时自动逐级回退；无损 FLAC 及以上需扫码登录会员账号。无损/母带文件较大（30-100MB），请同步调大「下载大小上限」",
         "type": "string",
         "options": [
-            "standard",
-            "higher",
-            "exhigh",
-            "lossless",
-            "hires",
-            "jymaster"
+            "标准 128k",
+            "较高 192k",
+            "极高 320k",
+            "无损 FLAC",
+            "高清臻音 Hi-Res",
+            "超清母带"
         ],
-        "default": "exhigh"
+        "default": "极高 320k"
     },
     "load_mode": {
         "description": "语音载入方式",
@@ -83,8 +101,8 @@
         "default": 20
     },
     "download_timeout": {
-        "description": "音频下载超时（秒）",
-        "hint": "下载歌曲文件的最长等待时间",
+        "description": "下载停滞超时（秒）",
+        "hint": "下载过程中超过该秒数没有新数据到达才判定失败（不是总时长限制），大文件慢速下载不会被误杀；失败会自动重试一次",
         "type": "int",
         "default": 20
     },
