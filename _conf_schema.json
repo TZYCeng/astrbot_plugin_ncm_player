@@ -1,7 +1,7 @@
 {
     "ncm_api_embedded": {
         "description": "内置 NeteaseCloudMusicApi 服务",
-        "hint": "开启后插件在（重）启动时自动下载官方 release 预编译服务（约 70MB，MIT 许可）并在本机运行，无需自己部署 Node 服务即可扫码登录、解锁无损/母带音质。默认关闭：不下载、不运行任何进程。开启后需重载插件/重启 AstrBot 生效",
+        "hint": "开启后插件在（重）启动时于本机后台运行官方预编译服务（已随插件打包，无需联网下载，MIT 许可），即可扫码登录、解锁无损/母带音质。默认关闭：不运行任何进程。开启后需重载插件/重启 AstrBot 生效",
         "type": "bool",
         "default": false
     },
@@ -12,8 +12,8 @@
         "default": 13000
     },
     "ncm_api_embedded_mirror": {
-        "description": "内置服务下载镜像前缀",
-        "hint": "服务器访问 GitHub 困难时填写加速前缀，如 https://ghfast.top/ ；留空则直连 GitHub。可复用 http_proxy 代理",
+        "description": "内置服务下载镜像前缀（仅兜底用）",
+        "hint": "仅当插件包内二进制缺失需联网下载时生效。服务器访问 GitHub 困难时填写加速前缀，如 https://ghfast.top/ ；留空则直连并自动轮换内置镜像。可复用 http_proxy 代理",
         "type": "string",
         "default": ""
     },

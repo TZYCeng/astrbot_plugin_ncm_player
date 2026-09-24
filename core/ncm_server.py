@@ -1,12 +1,12 @@
 """内置 NeteaseCloudMusicApi 服务管理。
 
 设计要点：
-- 默认关闭：不下载任何文件、不启动任何进程。
-- 仅在配置 ncm_api_embedded=true 且插件（重）启动时：
-  1. 检测数据目录中是否已有对应平台的预编译二进制，没有则从 GitHub Release 下载；
-  2. 以子进程方式启动服务（HOST=127.0.0.1，仅本机访问）；
-  3. 健康检查通过后，自动把插件音源切到内置服务。
-- 关闭开关或插件卸载/重载时，终止子进程；已下载的二进制保留，下次开启直接使用。
+- 默认关闭：不启动任何进程。
+- 二进制已随插件打包在 bin/ 目录（linux / windows / macOS x64），开箱即用；
+  打包文件缺失时才回退到 GitHub Release 下载（支持镜像轮换与断点续传）。
+- 仅在配置 ncm_api_embedded=true 且插件（重）启动时，以子进程方式启动服务
+  （HOST=127.0.0.1，仅本机访问），健康检查通过后自动把插件音源切到内置服务。
+- 关闭开关或插件卸载/重载时，终止子进程。
 
 二进制来源（MIT 许可，允许分发）：
 https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/releases
@@ -48,8 +48,12 @@ _MIRROR_CANDIDATES = [
 ]
 
 
+# 插件包内打包的二进制目录（core/ 的上一级 /bin）
+_BUNDLED_DIR = Path(__file__).resolve().parent.parent / "bin"
+
+
 class EmbeddedNcmServer:
-    """内置 NeteaseCloudMusicApi 服务的下载与进程管理"""
+    """内置 NeteaseCloudMusicApi 服务的二进制定位与进程管理"""
 
     def __init__(
         self,
@@ -84,12 +88,16 @@ class EmbeddedNcmServer:
 
     @property
     def bin_path(self) -> Path:
+        """优先使用插件包内打包的二进制，其次用数据目录中已下载的副本"""
+        bundled = _BUNDLED_DIR / self._asset_name()
+        if bundled.exists() and bundled.stat().st_size > 1024 * 1024:
+            return bundled
         return self.dir / self._asset_name()
 
     # ---------- 下载 ----------
 
     async def ensure_binary(self):
-        """二进制不存在则下载（约 70MB）。
+        """确保二进制可用：包内已打包则直接返回；否则从 Release 下载（兜底）。
 
         - 依次尝试：用户配置的镜像 → 直连 GitHub → 内置加速镜像；
         - 每个源失败自动换源，同一源最多试 2 次；
@@ -98,6 +106,7 @@ class EmbeddedNcmServer:
         path = self.bin_path
         if path.exists() and path.stat().st_size > 1024 * 1024:
             return
+        # 走到这里说明包内未打包且数据目录无副本，才需要联网下载
         self.dir.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".part")
         base = f"{RELEASE_BASE}/{self._asset_name()}"
@@ -175,6 +184,7 @@ class EmbeddedNcmServer:
         if self.process and self.process.returncode is None:
             return self.base_url  # 已在运行
 
+        self.dir.mkdir(parents=True, exist_ok=True)  # 作为进程工作目录
         env = {
             "PATH": "/usr/bin:/bin:/usr/local/bin",
             "PORT": str(self.port),
