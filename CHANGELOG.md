@@ -1,5 +1,13 @@
 # 更新日志 (CHANGELOG)
 
+## [v1.3.1] - 内置服务下载源自动轮换与断点续传
+
+*   **🐛 【修复】内置服务下载失败（Timeout on reading data from socket）**：
+    *   根因：直连 GitHub Release 下载约 70MB 二进制时网络停滞。现下载源自动轮换：用户配置镜像 → 直连 GitHub → 内置加速镜像（ghfast.top / gh-proxy.com），每个源最多试 2 次。
+    *   支持 Range 断点续传：中断后重试从已下载位置继续，不再从零开始；下载过程每 10MB 打印一次进度日志。
+    *   全部源失败时给出明确排查提示（配置 `ncm_api_embedded_mirror` 或 `http_proxy`）。
+    *   内置服务就绪等待由 45 秒放宽至 60 秒。
+
 ## [v1.3.0] - 内置 NeteaseCloudMusicApi 服务、登录体验修复、下载稳定性修复
 
 *   **✨ 【新特性】内置 NeteaseCloudMusicApi 服务（开箱即用的扫码登录）**：
