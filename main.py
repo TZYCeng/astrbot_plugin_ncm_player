@@ -27,7 +27,7 @@ LISTEN_PATTERN = "(" + "|".join(LISTEN_TRIGGERS) + ")"
     "astrbot_plugin_ncm_player",
     "Kimi",
     "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码登录、内置 NeteaseCloudMusicApi 服务",
-    "1.3.0",
+    "1.3.1",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: dict):
