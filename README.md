@@ -5,6 +5,7 @@
 - **双通道点歌**：LLM 工具自然语言点歌 + 关键词监听兜底
 - **发送方式自定义**：语音优先自动降级、只发语音、只发文件、只发卡片、或语音+文件+卡片一起发
 - **音质档位化**：标准 128k / 较高 192k / 极高 320k / 无损 FLAC / 高清臻音 Hi-Res / 超清母带，自动逐级回退
+- **内置 NeteaseCloudMusicApi**：一键开启即自动下载并运行官方预编译服务（MIT 许可），无需自己部署 Node 服务
 - **扫码登录**：`/网易云登录` 生成二维码，网易云音乐 App 扫码后解锁会员音质（无损 / Hi-Res / 母带）
 - **热评卡片**：点歌后嗅探一条最热评论，渲染成卡片随歌发送
 - **歌词合并转发**：嗅探整首歌词，以聊天记录（合并转发）形式发送，纯音乐自动跳过
@@ -36,22 +37,25 @@ AI：（发送播放卡片 + 语音 + 热评卡片 + 歌词合并转发）
 | --- | --- |
 | `/点歌 歌名` | 搜索并发送选歌图，120 秒内回复序号播放，发送「取消」退出 |
 | `/直接点歌 歌名` | 跳过选歌，直接播放第一首结果 |
-| `/网易云登录` | 生成登录二维码（需先配置 `ncm_api_base`），扫码解锁会员音质 |
+| `/网易云登录` | 生成登录二维码（需开启 `ncm_api_embedded` 或配置 `ncm_api_base`），扫码解锁会员音质 |
 
 ## 配置项
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `ncm_api_base` | 空 | NeteaseCloudMusicApi 服务地址，如 `http://127.0.0.1:3000`。配置后优先使用，支持扫码登录与母带级音质。部署见 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) |
+| `ncm_api_embedded` | `false` | 内置 NeteaseCloudMusicApi 服务开关。开启后插件（重）启动时自动下载官方 release 预编译服务（约 70MB，MIT 许可）并在本机运行，直接支持扫码登录与母带级音质；**默认关闭，不下载、不运行任何进程**，开启后需重载插件/重启生效 |
+| `ncm_api_embedded_port` | `13000` | 内置服务监听的本机端口（仅 127.0.0.1 可访问），端口冲突时再改 |
+| `ncm_api_embedded_mirror` | 空 | 内置服务下载镜像前缀（如 `https://ghfast.top/`），服务器访问 GitHub 困难时填写，留空直连 |
+| `ncm_api_base` | 空 | 外部 NeteaseCloudMusicApi 服务地址，如 `http://127.0.0.1:3000`。开启内置服务后本项被忽略；未开启时配置本项同样支持扫码登录。部署见 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) |
 | `meting_api` | `https://api.qijieya.cn/meting/` | Meting 镜像，官方接口失效时的备用音源（音质不可控），留空禁用 |
-| `quality` | `exhigh` | 音质档位：`standard` 标准128k / `higher` 较高192k / `exhigh` 极高320k / `lossless` 无损FLAC / `hires` 高清臻音 / `jymaster` 超清母带。取不到自动回退；无损及以上需登录会员 |
+| `quality` | `极高 320k` | 音质档位：标准 128k / 较高 192k / 极高 320k / 无损 FLAC / 高清臻音 Hi-Res / 超清母带。取不到自动回退；无损及以上需登录会员 |
 | `send_mode` | `auto` | `auto` 语音优先自动降级；`voice`/`file`/`card` 只发对应方式；`voice_card` 等下划线组合为同时多发 |
 | `load_mode` | `file` | `file`=本地路径（**推荐**，要求 AstrBot 与 NapCat 同机）；`url`=直链由协议端下载（跨机部署用，此模式不本地下载）；`base64`=编码内嵌（大文件会撑爆 WebSocket，慎用） |
 | `send_play_card` | `true` | 发送 CD 风播放卡片图 |
 | `send_comment_card` | `true` | 发送热评卡片 |
 | `send_lyrics_forward` | `true` | 发送歌词合并转发 |
 | `send_timeout` | `20` | 每种发送方式的超时秒数 |
-| `download_timeout` | `20` | 音频下载超时 |
+| `download_timeout` | `20` | 下载停滞超时：超过该秒数无新数据才判失败（慢速大文件不会被误杀），失败自动重试一次 |
 | `download_max_mb` | `40` | 超过此大小不下载，直接降级为卡片。无损/母带通常 30-100MB，用高音质请调大 |
 | `search_limit` | `5` | 选歌列表数量 |
 | `http_proxy` | 空 | HTTP 代理 |
@@ -66,7 +70,7 @@ AstrBot 的 aiocqhttp 适配器会把 Record 组件统一转成 base64（且会�
 
 播放地址按以下优先级获取：
 
-1. `ncm_api_base` 配置的 NeteaseCloudMusicApi 服务（音质可控，登录后可达母带级）
+1. NeteaseCloudMusicApi 服务（内置 `ncm_api_embedded` 或外部 `ncm_api_base`，音质可控，登录后可达母带级）
 2. 网易云官方网页接口（无登录态时多数返回 -110，仅作尝试）
 3. `meting_api` 镜像（实测可用，音质不可控）
 4. 网易云官方外链兜底
@@ -77,12 +81,18 @@ VIP / 无版权歌曲可能所有源都拿不到音频，此时会自动降级�
 
 ```
 astrbot_plugin_ncm_player/
-├── main.py              # 插件入口：LLM 工具 + 指令 + 扫码登录
+├── main.py              # 插件入口：LLM 工具 + 指令 + 扫码登录 + 内置服务生命周期
 ├── metadata.yaml        # 插件元数据
 ├── _conf_schema.json    # WebUI 配置项
 ├── requirements.txt
 └── core/
     ├── ncm_api.py       # 网易云 API：搜索 / 封面 / 播放地址 / 热评 / 歌词 / 二维码登录 / 下载
+    ├── ncm_server.py    # 内置 NeteaseCloudMusicApi：二进制下载 + 子进程管理（默认关闭）
     ├── renderer.py      # Pillow 渲染：CD 风选歌图、播放卡片、热评卡片
     └── sender.py        # 语音 / 文件 / 卡片 / 链接 发送与降级
 ```
+
+## 内置服务说明
+
+内置服务来自 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) 官方 Release 的预编译二进制（MIT 许可，允许分发，版权声明见该项目仓库）。
+插件本身不打包该二进制，仅在 `ncm_api_embedded` 开启且插件（重）启动时按平台（linux / windows / macOS x64）下载一次，存于插件数据目录 `ncm_api_server/`；关闭开关后不会下载也不会拉起进程，已下载文件保留以便下次开启直接使用。
