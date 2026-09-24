@@ -5,7 +5,7 @@
 - **双通道点歌**：LLM 工具自然语言点歌 + 关键词监听兜底
 - **发送方式自定义**：语音优先自动降级、只发语音、只发文件、只发卡片、或语音+文件+卡片一起发
 - **音质档位化**：标准 128k / 较高 192k / 极高 320k / 无损 FLAC / 高清臻音 Hi-Res / 超清母带，自动逐级回退
-- **内置 NeteaseCloudMusicApi**：一键开启即自动下载并运行官方预编译服务（MIT 许可），无需自己部署 Node 服务
+- **内置 NeteaseCloudMusicApi**：官方预编译服务已随插件打包（MIT 许可），一键开启即用，无需自己部署 Node 服务、无需联网下载
 - **扫码登录**：`/网易云登录` 生成二维码，网易云音乐 App 扫码后解锁会员音质（无损 / Hi-Res / 母带）
 - **热评卡片**：点歌后嗅探一条最热评论，渲染成卡片随歌发送
 - **歌词合并转发**：嗅探整首歌词，以聊天记录（合并转发）形式发送，纯音乐自动跳过
@@ -43,9 +43,9 @@ AI：（发送播放卡片 + 语音 + 热评卡片 + 歌词合并转发）
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `ncm_api_embedded` | `false` | 内置 NeteaseCloudMusicApi 服务开关。开启后插件（重）启动时自动下载官方 release 预编译服务（约 70MB，MIT 许可）并在本机运行，直接支持扫码登录与母带级音质；**默认关闭，不下载、不运行任何进程**，开启后需重载插件/重启生效 |
+| `ncm_api_embedded` | `false` | 内置 NeteaseCloudMusicApi 服务开关。开启后插件（重）启动时在后台运行官方预编译服务（已随插件打包于 `bin/`，无需联网下载），直接支持扫码登录与母带级音质；**默认关闭，不运行任何进程**，开启后需重载插件/重启生效 |
 | `ncm_api_embedded_port` | `13000` | 内置服务监听的本机端口（仅 127.0.0.1 可访问），端口冲突时再改 |
-| `ncm_api_embedded_mirror` | 空 | 内置服务下载镜像前缀（如 `https://ghfast.top/`），服务器访问 GitHub 困难时填写，留空直连 |
+| `ncm_api_embedded_mirror` | 空 | 内置服务下载镜像前缀（仅包内二进制缺失时的下载兜底），服务器访问 GitHub 困难时填写，留空直连并自动轮换内置镜像 |
 | `ncm_api_base` | 空 | 外部 NeteaseCloudMusicApi 服务地址，如 `http://127.0.0.1:3000`。开启内置服务后本项被忽略；未开启时配置本项同样支持扫码登录。部署见 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) |
 | `meting_api` | `https://api.qijieya.cn/meting/` | Meting 镜像，官方接口失效时的备用音源（音质不可控），留空禁用 |
 | `quality` | `极高 320k` | 音质档位：标准 128k / 较高 192k / 极高 320k / 无损 FLAC / 高清臻音 Hi-Res / 超清母带。取不到自动回退；无损及以上需登录会员 |
@@ -85,14 +85,15 @@ astrbot_plugin_ncm_player/
 ├── metadata.yaml        # 插件元数据
 ├── _conf_schema.json    # WebUI 配置项
 ├── requirements.txt
+├── bin/                 # 内置 NeteaseCloudMusicApi 预编译二进制（linux/win/mac，MIT 许可）
 └── core/
     ├── ncm_api.py       # 网易云 API：搜索 / 封面 / 播放地址 / 热评 / 歌词 / 二维码登录 / 下载
-    ├── ncm_server.py    # 内置 NeteaseCloudMusicApi：二进制下载 + 子进程管理（默认关闭）
+    ├── ncm_server.py    # 内置 NeteaseCloudMusicApi：二进制定位 + 子进程管理（默认关闭）
     ├── renderer.py      # Pillow 渲染：CD 风选歌图、播放卡片、热评卡片
     └── sender.py        # 语音 / 文件 / 卡片 / 链接 发送与降级
 ```
 
 ## 内置服务说明
 
-内置服务来自 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) 官方 Release 的预编译二进制（MIT 许可，允许分发，版权声明见该项目仓库）。
-插件本身不打包该二进制，仅在 `ncm_api_embedded` 开启且插件（重）启动时按平台（linux / windows / macOS x64）下载一次，存于插件数据目录 `ncm_api_server/`；关闭开关后不会下载也不会拉起进程，已下载文件保留以便下次开启直接使用。
+内置服务来自 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) 官方 Release 的预编译二进制（MIT 许可，允许分发，版权声明见该项目仓库），已按平台（linux / windows / macOS x64）打包在插件 `bin/` 目录，开启 `ncm_api_embedded` 后直接使用，**无需联网下载**。
+极少数情况下（打包文件被删或平台不匹配）会回退到 GitHub Release 下载，此时支持镜像轮换与断点续传，可用 `ncm_api_embedded_mirror` 指定加速前缀。
