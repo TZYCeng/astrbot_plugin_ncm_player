@@ -1,6 +1,6 @@
 name: astrbot_plugin_ncm_player
 display_name: 网易云点歌
 desc: 网易云点歌插件，可扫码登录解锁会员音质
-version: v1.2.2
+version: v1.3.0
 author: TZYCENG
 repo: https://github.com/TZYCeng/astrbot_plugin_ncm_player
