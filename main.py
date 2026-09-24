@@ -27,7 +27,7 @@ LISTEN_PATTERN = "(" + "|".join(LISTEN_TRIGGERS) + ")"
     "astrbot_plugin_ncm_player",
     "Kimi",
     "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码登录、内置 NeteaseCloudMusicApi 服务",
-    "1.4.1",
+    "1.4.2",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -52,7 +52,7 @@ class NcmPlayerPlugin(Star):
         self.sender = SongSender(self.cfg)
         # unified_msg_origin -> (时间戳, 候选歌曲)
         self.pending: dict[str, tuple[float, list[Song]]] = {}
-        # 内置 NeteaseCloudMusicApi 服务（默认关闭：不启动进程）
+        # 内置 NeteaseCloudMusicApi 服务（默认关闭：不下载、不启动进程）
         self.embedded: EmbeddedNcmServer | None = None
         if self.cfg.get("ncm_api_embedded", False):
             self.embedded = EmbeddedNcmServer(

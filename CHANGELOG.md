@@ -1,5 +1,11 @@
 # 更新日志 (CHANGELOG)
 
+## [v1.4.2] - 修复 VIP 歌曲间歇性只能下载 30 秒试听
+
+*   **🐛 【修复】登录会员后 VIP 歌曲时好时坏（偶尔只剩 30 秒试听）**：两个叠加原因——
+    *   **服务端缓存不认 Cookie**：NeteaseCloudMusicApi 的 apicache 按 URL 缓存响应，若某首歌在 Cookie 未生效的瞬间被请求过，30 秒试听地址会被缓存，之后带 Cookie 请求也命中旧缓存。现 `/song/url/v1` 统一携带毫秒时间戳参数破除缓存。
+    *   **CookieJar 干扰手动鉴权**：aiohttp 会话会自动保存登录接口 Set-Cookie 并与手动传入的 Cookie 头叠加，可能出现重复/过期 MUSIC_U。现改用 DummyCookieJar 完全禁用会话自动 Cookie，登录态只由插件持久化的 Cookie 文件决定。
+
 ## [v1.4.1] - 修复内置服务 Permission denied
 
 *   **🐛 【修复】内置服务启动报 Permission denied**：zip 安装或只读挂载的插件目录中，二进制没有执行权限。现启动前统一把二进制复制到插件数据目录并赋予执行权限再运行，数据目录副本与包内文件大小一致时直接复用，不重复复制。
