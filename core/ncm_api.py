@@ -9,8 +9,8 @@
 登录态感知：
 - 接口返回带 freeTrialInfo 的地址 = 30 秒试听片段（登录失效/未登录/非会员），
   绝不当作成功，立即复核登录态并自动降级到 Meting 镜像；
-- probe_login() 解析 /login/status 的 account 与 vipType（缺失时以 /user/detail
-  二次确认），维护 login_valid/vip，供插件在点歌时给出「登录失效」提示。
+- probe_login() 解析 /login/status 的 account 与 vipType，维护 login_valid/vip，
+  供插件在点歌时给出「登录失效」提示。
 """
 
 import asyncio
@@ -234,7 +234,6 @@ class NetEaseAPI:
         if self.ncm_api_base:
             levels = list(dict.fromkeys([prefer[2], *LEVEL_FALLBACK]))
             trial = False
-            trial_fee = 0
             for lv in levels:
                 try:
                     # timestamp 破缓存：服务端 apicache 按 URL 缓存、不区分 Cookie，
@@ -254,8 +253,8 @@ class NetEaseAPI:
                             f"（freeTrialInfo），登录态失效或账号非会员，自动降级镜像"
                         )
                         trial = True
-                        trial_fee = int(d.get("fee", 0) or 0)
                         await self.probe_login()
+                        trial_fee = int(d.get("fee", 0) or 0)
                         break
                     return PlayInfo(
                         url=d["url"],
@@ -290,16 +289,13 @@ class NetEaseAPI:
                         f"[ncm_player] 歌曲 {song_id} 官方接口仅返回试听片段，自动降级镜像"
                     )
                     await self.probe_login()
-                    return self._meting_or_outer(
-                        song_id, reason="trial", fee=int(data.get("fee", 0) or 0)
-                    )
+                    return self._meting_or_outer(song_id, reason="trial")
                 return PlayInfo(
                     url=data["url"],
                     br=data.get("br", br),
                     size=data.get("size", 0),
                     ext=(data.get("type") or "mp3").lower(),
                     source="web",
-                    fee=int(data.get("fee", 0) or 0),
                 )
             except Exception as e:
                 logger.warning(f"[ncm_player] 官方接口取地址失败(br={br}): {e}")
@@ -442,10 +438,15 @@ class NetEaseAPI:
             account = data.get("account") or {}
             profile = data.get("profile") or {}
             self.login_valid = bool(account.get("id"))
-            # /login/status 走 /api/w/nuser/account/get，是轻量接口，
-            # profile 经常不含 vipType（SVIP 也会被误判为非会员）；
-            # 拿不到 vipType 时用 /user/detail 的完整 profile 二次确认
-            vip_type = profile.get("vipType") or 0
+            # VIP 判定取三个来源的最大值：
+            # 1) login/status 的 account.vipType（账号对象自带该字段）
+            # 2) login/status 的 profile.vipType（轻量接口经常不返回）
+            # 3) /user/detail 完整 profile 的 vipType（兜底二次确认）
+            vip_type = max(
+                int(account.get("vipType") or 0),
+                int(profile.get("vipType") or 0),
+            )
+            detail_vip_type: int | None = None
             if self.login_valid and not vip_type:
                 try:
                     detail = await self._get(
@@ -453,10 +454,21 @@ class NetEaseAPI:
                         auth=True,
                         params={"uid": account["id"], "timestamp": self._ts()},
                     )
-                    vip_type = (detail.get("profile") or {}).get("vipType") or 0
+                    detail_vip_type = int(
+                        (detail.get("profile") or {}).get("vipType") or 0
+                    )
+                    vip_type = max(vip_type, detail_vip_type)
                 except Exception as e:
                     logger.warning(f"[ncm_player] 获取用户详情失败（按非 VIP 处理）: {e}")
             self.vip = bool(vip_type)
+            # 诊断日志：同时证明插件版本已生效，并暴露各来源的 vipType 原始值
+            logger.info(
+                f"[ncm_player] 登录复核完成(v1.4.6)：uid={account.get('id')}, "
+                f"account.vipType={account.get('vipType')}, "
+                f"profile.vipType={profile.get('vipType')}, "
+                f"user/detail.vipType={detail_vip_type if detail_vip_type is not None else '未查询'}, "
+                f"最终判定={'VIP' if self.vip else '非 VIP'}"
+            )
             if not self.login_valid:
                 logger.warning(
                     "[ncm_player] 登录复核：cookie 已失效（接口未返回账号信息）"
