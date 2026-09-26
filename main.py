@@ -17,6 +17,7 @@ from .core.sender import SongSender
 
 PENDING_EXPIRE = 300  # 选歌缓存有效期（秒）
 LYRICS_PER_NODE = 30  # 合并转发每条消息的歌词行数
+INVALID_NOTICE_INTERVAL = 600  # 登录失效提示最小间隔（秒），避免刷屏
 
 # 关键词监听触发词
 LISTEN_TRIGGERS = ["我要听", "我想听", "想听", "听歌", "点歌", "来一首", "来首", "放一首", "放首", "播放"]
@@ -27,7 +28,7 @@ LISTEN_PATTERN = "(" + "|".join(LISTEN_TRIGGERS) + ")"
     "astrbot_plugin_ncm_player",
     "Kimi",
     "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码登录、内置 NeteaseCloudMusicApi 服务",
-    "1.4.2",
+    "1.4.4",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -84,12 +85,21 @@ class NcmPlayerPlugin(Star):
                     f"回退到既有音源链路: {e}"
                 )
         if self.api.ncm_api_base and self.api.cookie:
-            if await self.api.check_login():
-                logger.info("[ncm_player] 检测到已登录的网易云账号，会员音质可用")
+            if await self.api.probe_login(force=True):
+                if self.api.vip:
+                    logger.info(
+                        "[ncm_player] 检测到已登录的网易云 VIP 账号，会员音质可用"
+                    )
+                else:
+                    logger.warning(
+                        "[ncm_player] 检测到已登录的网易云账号，但该账号不是 VIP，"
+                        "会员歌曲将自动降级到 Meting 镜像"
+                    )
             else:
                 logger.warning(
                     "[ncm_player] 本地 cookie 已失效或未登录，"
-                    "无损及以上音质不可用，可使用 /网易云登录 重新扫码"
+                    "无损及以上音质不可用，VIP 歌曲将自动降级到 Meting 镜像，"
+                    "可使用 /网易云登录 重新扫码"
                 )
 
     async def terminate(self):
@@ -192,23 +202,58 @@ class NcmPlayerPlugin(Star):
         except Exception as e:
             logger.warning(f"[ncm_player] 歌词合并转发发送失败: {e}")
 
+    async def _notify_login_invalid(self, event: AstrMessageEvent):
+        """登录失效/未登录时给点歌用户一个明确提示（10 分钟内最多一次，避免刷屏）"""
+        if not self.api.ncm_api_base:
+            return
+        if self.api.login_valid is not False:
+            return
+        now = time.time()
+        if now - self._invalid_notice_ts < INVALID_NOTICE_INTERVAL:
+            return
+        self._invalid_notice_ts = now
+        try:
+            await event.send(
+                event.plain_result(
+                    "⚠️ 网易云未登录或登录已失效，无损/会员音质不可用，"
+                    "VIP 歌曲已自动降级到 Meting 镜像（音质受限）。"
+                    "管理员可使用 /网易云登录 重新扫码解锁"
+                )
+            )
+        except Exception as e:
+            logger.warning(f"[ncm_player] 登录失效提示发送失败: {e}")
+
     async def _play(self, event: AstrMessageEvent, song: Song) -> str:
         """取播放地址 → 下载（如需）→ 播放卡片 → 发送 → 热评/歌词。返回结果描述"""
+        # 点歌时若已知登录失效，先给提示
+        await self._notify_login_invalid(event)
         quality = normalize_quality(self.cfg.get("quality", "exhigh"))
         play = await self.api.get_play_info(song.id, quality)
         if not play or not play.url:
             return f"未能获取《{song.name}》的播放地址（可能为 VIP/无版权歌曲）"
+        # 本次取地址若新检测到试听片段（登录失效/非会员），登录态已刷新，再提示一次
+        if self.api.last_fallback == "trial":
+            await self._notify_login_invalid(event)
 
         load_mode = str(self.cfg.get("load_mode", "file"))
         audio_path = None
         if load_mode in ("file", "base64"):
             audio_path = await self._download(song, play)
 
-        # 播放卡片图（CD + 歌名）
+        # 播放卡片图（CD + 歌名；VIP 歌曲按下载来源标红/灰 VIP 框）
         if self.cfg.get("send_play_card", True):
             try:
+                vip_mark = ""
+                if play.is_vip_song or self.api.last_fallback == "trial":
+                    vip_mark = (
+                        "ok"
+                        if play.source == "ncm" and self.api.vip
+                        else "mirror"
+                    )
                 cover = await self.api.fetch_bytes(song.pic_url)
-                card = self.renderer.render_playing(song, cover, play.quality_str)
+                card = self.renderer.render_playing(
+                    song, cover, play.quality_str, vip_mark
+                )
                 await event.send(event.chain_result([Image.fromFileSystem(card)]))
             except Exception as e:
                 logger.warning(f"[ncm_player] 播放卡片发送失败: {e}")
@@ -231,7 +276,10 @@ class NcmPlayerPlugin(Star):
                 )
             except Exception:
                 pass
-        return f"《{song.name}》- {song.artists}，音质 {play.quality_str}，以「{method}」方式发送"
+        result = f"《{song.name}》- {song.artists}，音质 {play.quality_str}，以「{method}」方式发送"
+        if self.api.last_fallback == "trial":
+            result += "（VIP/登录失效，已自动降级 Meting 镜像）"
+        return result
 
     # ---------- LLM 工具 ----------
 
@@ -437,9 +485,27 @@ class NcmPlayerPlugin(Star):
                 if cookie:
                     self.api.set_cookie(cookie)
                     self.cookie_file.write_text(cookie, encoding="utf-8")
-                await event.send(
-                    event.plain_result("✅ 网易云登录成功，已解锁会员音质")
-                )
+                # 立即复核登录态与会员身份，并重置失效提示节流
+                self._invalid_notice_ts = 0.0
+                await self.api.probe_login(force=True)
+                if self.api.login_valid and self.api.vip:
+                    await event.send(
+                        event.plain_result("✅ 网易云登录成功（VIP 账号），已解锁会员音质")
+                    )
+                elif self.api.login_valid:
+                    await event.send(
+                        event.plain_result(
+                            "✅ 网易云登录成功，但该账号不是 VIP，"
+                            "会员歌曲仍会只能试听并自动降级到 Meting 镜像"
+                        )
+                    )
+                else:
+                    await event.send(
+                        event.plain_result(
+                            "✅ 扫码确认成功，但登录状态校验未通过，"
+                            "若下载仍是试听片段请重新扫码"
+                        )
+                    )
                 return
             if code == 802 and not confirmed:
                 confirmed = True
