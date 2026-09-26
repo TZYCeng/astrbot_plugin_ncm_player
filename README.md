@@ -43,9 +43,9 @@ AI：（发送播放卡片 + 语音 + 热评卡片 + 歌词合并转发）
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `ncm_api_embedded` | `false` | 内置 NeteaseCloudMusicApi 服务开关。开启后插件（重）启动时在后台运行官方预编译服务（已随插件打包于 `bin/`，无需联网下载），直接支持扫码登录与母带级音质；**默认关闭，不运行任何进程**，开启后需重载插件/重启生效 |
+| `ncm_api_embedded` | `false` | 内置 NeteaseCloudMusicApi 服务开关。开启后插件（重）启动时自动下载官方 release 预编译服务（约 70MB，MIT 许可）并在本机运行，直接支持扫码登录与母带级音质；**默认关闭，不下载、不运行任何进程**，开启后需重载插件/重启生效 |
 | `ncm_api_embedded_port` | `13000` | 内置服务监听的本机端口（仅 127.0.0.1 可访问），端口冲突时再改 |
-| `ncm_api_embedded_mirror` | 空 | 内置服务下载镜像前缀（仅包内二进制缺失时的下载兜底），服务器访问 GitHub 困难时填写，留空直连并自动轮换内置镜像 |
+| `ncm_api_embedded_mirror` | 空 | 内置服务下载镜像前缀（如 `https://ghfast.top/`），服务器访问 GitHub 困难时填写，留空直连 |
 | `ncm_api_base` | 空 | 外部 NeteaseCloudMusicApi 服务地址，如 `http://127.0.0.1:3000`。开启内置服务后本项被忽略；未开启时配置本项同样支持扫码登录。部署见 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) |
 | `meting_api` | `https://api.qijieya.cn/meting/` | Meting 镜像，官方接口失效时的备用音源（音质不可控），留空禁用 |
 | `quality` | `极高 320k` | 音质档位：标准 128k / 较高 192k / 极高 320k / 无损 FLAC / 高清臻音 Hi-Res / 超清母带。取不到自动回退；无损及以上需登录会员 |
@@ -75,6 +75,8 @@ AstrBot 的 aiocqhttp 适配器会把 Record 组件统一转成 base64（且会�
 3. `meting_api` 镜像（实测可用，音质不可控）
 4. 网易云官方外链兜底
 
+**试听片段识别与登录失效提示（v1.4.3+）**：接口返回带 `freeTrialInfo` 的地址时说明只拿到 30 秒试听（登录失效/未登录/账号非 VIP），插件不会把它发给用户，而是立即复核登录态并自动降级到 Meting 镜像下载完整歌曲；确认登录失效后，点歌时会先收到「登录失效，请重新扫码」提示（10 分钟内最多一次），扫码登录成功后立即复核并提示账号是否为 VIP。
+
 VIP / 无版权歌曲可能所有源都拿不到音频，此时会自动降级为音乐卡片或链接。
 
 ## 目录结构
@@ -95,5 +97,5 @@ astrbot_plugin_ncm_player/
 
 ## 内置服务说明
 
-内置服务来自 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) 官方 Release 的预编译二进制（MIT 许可，允许分发，版权声明见该项目仓库），已按平台（linux / windows / macOS x64）打包在插件 `bin/` 目录，开启 `ncm_api_embedded` 后直接使用，**无需联网下载**。
-极少数情况下（打包文件被删或平台不匹配）会回退到 GitHub Release 下载，此时支持镜像轮换与断点续传，可用 `ncm_api_embedded_mirror` 指定加速前缀。
+内置服务来自 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) 官方 Release 的预编译二进制（MIT 许可，允许分发，版权声明见该项目仓库）。
+插件本身不打包该二进制，仅在 `ncm_api_embedded` 开启且插件（重）启动时按平台（linux / windows / macOS x64）下载一次，存于插件数据目录 `ncm_api_server/`；关闭开关后不会下载也不会拉起进程，已下载文件保留以便下次开启直接使用。
