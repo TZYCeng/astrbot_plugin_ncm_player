@@ -1,5 +1,11 @@
 # 更新日志 (CHANGELOG)
 
+## [v1.4.5] - 修复 SVIP 账号被误判为非 VIP
+
+*   **🐛 【修复】黑胶 VIP/SVIP 账号登录后被提示「该账号不是 VIP」**：
+    *   根因：`/login/status` 底层走 `/api/w/nuser/account/get` 轻量接口，其 profile 经常不携带 `vipType` 字段，SVIP 账号也会被判定为非会员，导致会员歌曲被错误地降级到 Meting 镜像、播放卡片显示灰框。
+    *   修复：登录复核拿不到 `vipType` 时，自动调用 `/user/detail?uid=` 获取完整用户资料二次确认会员身份；两处任一返回 `vipType>0` 即判定为 VIP。
+
 ## [v1.4.4] - 播放卡片 VIP 标记：红框 = VIP 账号下载，灰框 = 镜像降级
 
 *   **✨ 【新特性】播放卡片 VIP 徽标**：VIP 歌曲（接口 fee=1/4 或检出试听降级）在播放卡片上显示「VIP · 音质」胶囊——
