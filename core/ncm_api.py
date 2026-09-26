@@ -424,6 +424,52 @@ class NetEaseAPI:
             cookie = "; ".join([cookie, *(p for p in pairs if p.partition("=")[0] not in existing)]).strip("; ")
             return code, cookie
 
+    async def send_captcha(self, phone: str, countrycode: str = "86") -> None:
+        """发送短信；请求和异常中的敏感参数不得进入日志或聊天。"""
+        try:
+            async with self.session.post(
+                f"{self.ncm_api_base}/captcha/sent",
+                proxy=self.proxy,
+                headers=self._auth_headers(""),
+                data={"phone": phone, "ctcode": countrycode, "timestamp": self._ts()},
+            ) as resp:
+                resp.raise_for_status()
+                result = await resp.json(content_type=None)
+            if result.get("code") != 200:
+                raise ValueError("验证码发送未成功；可能受到风控，请稍后在官方客户端确认")
+        except Exception:
+            raise ValueError("验证码发送失败或受到风控；请检查服务或稍后在官方客户端确认") from None
+
+    async def login_cellphone(self, phone: str, captcha: str, countrycode: str = "86") -> str:
+        """返回新的认证 Cookie；仅采用本次响应，不使用已有会话 Cookie。"""
+        try:
+            async with self.session.post(
+                f"{self.ncm_api_base}/login/cellphone",
+                proxy=self.proxy,
+                headers=self._auth_headers(""),
+                data={"phone": phone, "countrycode": countrycode,
+                      "captcha": captcha, "timestamp": self._ts()},
+            ) as resp:
+                resp.raise_for_status()
+                result = await resp.json(content_type=None)
+                if result.get("code") != 200:
+                    raise ValueError("验证码登录未成功；请核对验证码，若受风控请停止重试")
+                cookie = result.get("cookie") or ""
+                if not isinstance(cookie, str):
+                    cookie = ""
+                existing = {part.strip().partition("=")[0] for part in cookie.split(";")}
+                pairs = [part.split(";", 1)[0].strip()
+                         for part in resp.headers.getall("Set-Cookie", [])]
+                cookie = "; ".join([cookie, *(part for part in pairs
+                                           if "=" in part and part.partition("=")[0] not in existing)]).strip("; ")
+                if not any(part.strip().partition("=")[0] in ("MUSIC_U", "MUSIC_A")
+                           and part.strip().partition("=")[2].strip()
+                           for part in cookie.split(";")):
+                    raise ValueError("服务未返回可用的新认证 Cookie；原登录态未更改")
+                return cookie
+        except Exception:
+            raise ValueError("验证码登录请求失败或受到风控；请检查服务或稍后重试") from None
+
     # 登录态复核防抖间隔（秒）：避免每首 VIP 歌都重复打 /login/status
     LOGIN_CHECK_INTERVAL = 60
 
@@ -485,8 +531,8 @@ class NetEaseAPI:
                         (detail.get("profile") or {}).get("vipType") or 0
                     )
                     vip_type = max(vip_type, detail_vip_type)
-                except Exception as e:
-                    logger.warning(f"[ncm_player] 获取用户详情失败（按非 VIP 处理）: {e}")
+                except Exception:
+                    logger.warning("[ncm_player] 获取用户详情失败（按非 VIP 处理）")
             self.login_valid = login_valid
             self.account_uid = account_uid
             self.account_user_name = account_user_name
@@ -510,8 +556,8 @@ class NetEaseAPI:
                 logger.warning(
                     "[ncm_player] 登录复核：cookie 已失效（接口未返回账号信息）"
                 )
-        except Exception as e:
-            logger.warning(f"[ncm_player] 登录状态校验失败（保留原状态）: {e}")
+        except Exception:
+            logger.warning("[ncm_player] 登录状态校验失败（保留原状态）")
         return bool(self.login_valid)
 
     async def check_login(self) -> bool:
