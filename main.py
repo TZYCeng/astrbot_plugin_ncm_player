@@ -19,6 +19,7 @@ from .core.sender import SongSender
 PENDING_EXPIRE = 300  # 选歌缓存有效期（秒）
 LYRICS_PER_NODE = 30  # 合并转发每条消息的歌词行数
 INVALID_NOTICE_INTERVAL = 600  # 登录失效提示最小间隔（秒），避免刷屏
+CAPTCHA_COOLDOWN = 60  # 每个管理员发送短信的最小间隔（秒）
 
 # 关键词监听触发词
 LISTEN_TRIGGERS = ["我要听", "我想听", "想听", "听歌", "点歌", "来一首", "来首", "放一首", "放首", "播放"]
@@ -36,8 +37,8 @@ def _mask_name(s: str) -> str:
 @register(
     "astrbot_plugin_ncm_player",
     "Kimi",
-    "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码登录、内置 NeteaseCloudMusicApi 服务",
-    "1.4.8",
+    "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码/短信验证码登录、内置 NeteaseCloudMusicApi 服务",
+    "1.4.9",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -67,6 +68,8 @@ class NcmPlayerPlugin(Star):
         self._login_lock = asyncio.Lock()
         self._login_generation = 0
         self._login_active = False
+        self._captcha_controller: SessionController | None = None
+        self._captcha_sent_at: dict[str, float] = {}
         self._active_qr_path = None
         # 内置 NeteaseCloudMusicApi 服务（默认关闭：不下载、不启动进程）
         self.embedded: EmbeddedNcmServer | None = None
@@ -506,12 +509,14 @@ class NcmPlayerPlugin(Star):
         """仅退出本插件的本地登录，不撤销 App 设备授权。"""
         error = None
         async with self._login_lock:
+            self._login_generation += 1
+            if self._captcha_controller:
+                self._captcha_controller.stop()
             try:
                 self.cookie_file.unlink(missing_ok=True)
             except OSError as e:
                 error = str(e)
             else:
-                self._login_generation += 1
                 self.api.set_cookie("")
                 self._invalid_notice_ts = 0.0
         if error:
@@ -540,6 +545,173 @@ class NcmPlayerPlugin(Star):
             async with self._login_lock:
                 self._login_active = False
         yield event.plain_result(result)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("网易云验证码登录")
+    async def cmd_captcha_login(self, event: AstrMessageEvent):
+        """仅在管理员私聊会话中获取手机号和短信验证码。"""
+        if not event.is_private_chat() or not event.is_admin():
+            yield event.plain_result("仅支持管理员私聊操作；不要在群聊发送手机号或验证码")
+            return
+        if (event.message_str or "").strip().split() != ["/网易云验证码登录"]:
+            yield event.plain_result("命令不能附带手机号或验证码；请仅发送 /网易云验证码登录")
+            return
+        if not self.api.ncm_api_base:
+            yield event.plain_result("请先开启内置服务或配置 ncm_api_base")
+            return
+        async with self._login_lock:
+            active = self._login_active
+            if not active:
+                self._login_active = True
+                generation = self._login_generation
+        if active:
+            yield event.plain_result("已有登录进行中，请等待其结束")
+            return
+        try:
+            result = await self._captcha_flow(event, generation)
+        finally:
+            async with self._login_lock:
+                self._login_active = False
+        yield event.plain_result(result)
+
+    async def _captcha_flow(self, event: AstrMessageEvent, generation: int) -> str:
+        sender = event.get_sender_id()
+        origin = event.unified_msg_origin
+        stage = "phone"
+        phone = ""
+        attempts = 0
+        result = "验证码等待超时；原登录态未更改"
+        await event.send(event.plain_result(
+            "请在此管理员私聊发送绑定网易云账号的中国大陆手机号（默认国家码 86）。"
+            "聊天平台可能留存私聊内容，请仅在可信环境使用；发送「取消」结束。"
+        ))
+
+        @session_waiter(timeout=180)
+        async def captcha_waiter(controller: SessionController, ev: AstrMessageEvent):
+            nonlocal stage, phone, attempts, result
+            self._captcha_controller = controller
+            if (ev.unified_msg_origin != origin or ev.get_sender_id() != sender
+                    or not ev.is_private_chat() or not ev.is_admin()):
+                return
+            if generation != self._login_generation:
+                result = "登录已被退出登录操作取消；原登录态未更改"
+                controller.stop()
+                return
+            ev.stop_event()
+            text = (ev.message_str or "").strip()
+            if text == "取消":
+                result = "已取消验证码登录；原登录态未更改"
+                controller.stop()
+                return
+            if stage == "phone":
+                if not re.fullmatch(r"1[3-9][0-9]{9}", text):
+                    await ev.send(ev.plain_result("手机号格式无效；请发送 11 位中国大陆手机号或「取消」"))
+                    return
+                now = time.monotonic()
+                async with self._login_lock:
+                    if generation != self._login_generation:
+                        result = "登录已取消；原登录态未更改"
+                        controller.stop()
+                        return
+                    if now - self._captcha_sent_at.get(sender, -CAPTCHA_COOLDOWN) < CAPTCHA_COOLDOWN:
+                        result = "短信发送过于频繁；请稍后再试，原登录态未更改"
+                        controller.stop()
+                        return
+                    self._captcha_sent_at[sender] = now
+                phone = text
+                try:
+                    await self.api.send_captcha(phone)
+                except Exception:
+                    result = "短信发送失败或受到风控；请稍后在官方客户端确认，原登录态未更改"
+                    controller.stop()
+                    return
+                if generation != self._login_generation:
+                    result = "登录已取消；原登录态未更改"
+                    controller.stop()
+                    return
+                stage = "captcha"
+                await ev.send(ev.plain_result("短信请求已提交；请在此私聊发送验证码（3 分钟内），或发送「取消」。请勿转发验证码。"))
+                return
+            if not re.fullmatch(r"[0-9]{4,8}", text):
+                await ev.send(ev.plain_result("验证码格式无效；请发送 4-8 位数字或「取消」"))
+                return
+            attempts += 1
+            try:
+                cookie = await self.api.login_cellphone(phone, text)
+            except Exception:
+                if attempts >= 2:
+                    result = "验证码登录未成功；已达到重试上限，请停止重试并检查是否受到风控"
+                    controller.stop()
+                else:
+                    await ev.send(ev.plain_result("验证码登录未成功；最多再试一次，若受到风控请停止重试"))
+                return
+            if generation != self._login_generation:
+                result = "登录已取消；原登录态未更改"
+                controller.stop()
+                return
+            candidate = NetEaseAPI(
+                proxy=self.cfg.get("http_proxy", ""),
+                ncm_api_base=self.api.ncm_api_base, cookie=cookie,
+            )
+            try:
+                result = await self._save_login(cookie, candidate, generation, "验证码")
+            finally:
+                await candidate.close()
+            controller.stop()
+
+        try:
+            await captcha_waiter(event)
+        except TimeoutError:
+            result = "验证码等待超时；原登录态未更改"
+        except Exception:
+            result = "验证码登录失败；原登录态未更改"
+        finally:
+            self._captcha_controller = None
+            phone = ""
+        if generation != self._login_generation:
+            return "登录已被退出登录操作取消；原登录态未更改"
+        return result
+
+    async def _save_login(self, cookie: str, candidate: NetEaseAPI,
+                          generation: int, method: str) -> str:
+        try:
+            valid = await candidate.probe_login(force=True)
+        except Exception:
+            valid = False
+        if not valid or not candidate.account_uid:
+            return "新 Cookie 未通过独立 UID 复核；原登录态未更改，请检查服务或重试"
+        async with self._login_lock:
+            if generation != self._login_generation:
+                return "登录已被退出登录操作取消；新 Cookie 未保存"
+            tmp = self.cookie_file.with_name(f"ncm_cookie_{uuid.uuid4().hex}.tmp")
+            try:
+                tmp.write_text(cookie, encoding="utf-8")
+                os.replace(tmp, self.cookie_file)
+            except OSError:
+                logger.warning("[ncm_player] Cookie 保存失败")
+                return "新 Cookie 复核通过，但本地保存失败；原登录态未更改"
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("[ncm_player] 临时 Cookie 文件清理失败")
+            self.api.set_cookie(cookie)
+            self.api.login_valid = True
+            self.api.vip = candidate.vip
+            self.api.account_uid = candidate.account_uid
+            self.api.account_user_name = candidate.account_user_name
+            self.api.account_anomaly = candidate.account_anomaly
+            self.api.login_detail_code = candidate.login_detail_code
+            self.api._login_check_ts = time.time()
+            self._invalid_notice_ts = 0.0
+        name = ""
+        if method == "扫码" and candidate.account_user_name:
+            name = f"，昵称/用户名：{_mask_name(candidate.account_user_name)}"
+        status = "VIP 字段已确认" if candidate.vip else "未从接口确认 VIP 身份"
+        detail = (f"；user/detail 返回 {candidate.login_detail_code}，不能据此断定登错账号"
+                  if candidate.account_anomaly else "")
+        return (f"{method}登录并复核成功：UID {candidate.account_uid}{name}；{status}{detail}。"
+                "请对照网易云 App 中的 UID；若会员权益不符，排查服务、代理及接口缓存。")
 
     def _expire_qr(self, path):
         if self._active_qr_path == path:
@@ -601,39 +773,7 @@ class NcmPlayerPlugin(Star):
                 cookie=cookie,
             )
             try:
-                valid = await candidate.probe_login(force=True)
-                if not valid or not candidate.account_uid:
-                    return "扫码已确认，但新 Cookie 未通过独立登录复核；原登录态未更改，请检查服务或重试"
-                async with self._login_lock:
-                    if generation != self._login_generation:
-                        return "登录已被退出登录操作取消；新 Cookie 未保存"
-                    tmp = self.cookie_file.with_name(f"ncm_cookie_{uuid.uuid4().hex}.tmp")
-                    try:
-                        tmp.write_text(cookie, encoding="utf-8")
-                        os.replace(tmp, self.cookie_file)
-                    except OSError as e:
-                        logger.warning(f"[ncm_player] Cookie 保存失败: {e}")
-                        return "新 Cookie 复核通过，但本地保存失败；原内存登录态未更改"
-                    finally:
-                        try:
-                            tmp.unlink(missing_ok=True)
-                        except OSError:
-                            logger.warning("[ncm_player] 临时 Cookie 文件清理失败")
-                    self.api.set_cookie(cookie)
-                    self.api.login_valid = True
-                    self.api.vip = candidate.vip
-                    self.api.account_uid = candidate.account_uid
-                    self.api.account_user_name = candidate.account_user_name
-                    self.api.account_anomaly = candidate.account_anomaly
-                    self.api.login_detail_code = candidate.login_detail_code
-                    self.api._login_check_ts = time.time()
-                    self._invalid_notice_ts = 0.0
-                name = f"，昵称/用户名：{_mask_name(candidate.account_user_name)}" if candidate.account_user_name else ""
-                status = "VIP 字段已确认" if candidate.vip else "未从接口确认 VIP 身份"
-                detail = (f"；user/detail 返回 {candidate.login_detail_code}，不能据此断定登错账号"
-                          if candidate.account_anomaly else "")
-                return (f"扫码登录并复核成功：UID {candidate.account_uid}{name}；{status}{detail}。"
-                        "请对照网易云 App 中的 UID；若会员权益不符，排查服务、代理及接口缓存。")
+                return await self._save_login(cookie, candidate, generation, "扫码")
             finally:
                 await candidate.close()
         return "登录等待超时，请重新发起"
