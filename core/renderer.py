@@ -298,7 +298,11 @@ class CardRenderer:
 
     # ---------- 播放卡片 ----------
 
-    def render_playing(self, song: Song, cover: bytes | None, quality: str) -> str:
+    def render_playing(
+        self, song: Song, cover: bytes | None, quality: str, vip: str = ""
+    ) -> str:
+        """vip: ""=普通歌曲（红色音质胶囊）；"ok"=VIP 歌曲·VIP 账号下载（红色 VIP 框）；
+        "mirror"=VIP 歌曲·非 VIP/镜像下载（灰色 VIP 框）"""
         W, H, pad = 980, 520, 36
         bg = _v_gradient(W, H, BG_TOP, BG_BOTTOM).convert("RGBA")
         draw = ImageDraw.Draw(bg)
@@ -334,13 +338,22 @@ class CardRenderer:
             _ellipsize(draw, meta, f_meta, max_tw),
             font=f_meta, fill=LIGHT_GRAY,
         )
-        # 音质胶囊
-        tag = f"♪ {quality}"
+        # 音质 / VIP 胶囊
+        if vip == "ok":
+            tag, tag_color = f"VIP · {quality}", ACCENT          # VIP 账号下载：红框
+        elif vip == "mirror":
+            tag, tag_color = f"VIP · {quality}", LIGHT_GRAY      # 非 VIP/镜像：灰框
+        else:
+            tag, tag_color = f"♪ {quality}", ACCENT              # 普通歌曲：红色音质框
+        tag = _ellipsize(draw, tag, f_tag, max_tw)
         tw = draw.textlength(tag, font=f_tag)
         draw.rounded_rectangle(
-            (tx, pad + 214, tx + tw + 34, pad + 214 + 40), 20, outline=ACCENT, width=2
+            (tx, pad + 214, tx + tw + 34, pad + 214 + 40), 20,
+            outline=tag_color, width=2,
         )
-        draw.text((tx + 17, pad + 214 + 20), tag, font=f_tag, fill=ACCENT, anchor="lm")
+        draw.text(
+            (tx + 17, pad + 214 + 20), tag, font=f_tag, fill=tag_color, anchor="lm"
+        )
 
         # 品牌角标
         draw.text(

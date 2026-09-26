@@ -5,6 +5,12 @@
 2. 网易云官方网页接口（无登录态时多数返回 -110，仅作尝试）
 3. Meting 镜像（音质不可控，通常 128-320k mp3）
 4. 网易云官方外链兜底
+
+登录态感知：
+- 接口返回带 freeTrialInfo 的地址 = 30 秒试听片段（登录失效/未登录/非会员），
+  绝不当作成功，立即复核登录态并自动降级到 Meting 镜像；
+- probe_login() 解析 /login/status 的 account 与 vipType，维护 login_valid/vip，
+  供插件在点歌时给出「登录失效」提示。
 """
 
 import asyncio
@@ -71,6 +77,12 @@ class PlayInfo:
     size: int = 0      # 字节，0 表示未知
     ext: str = "mp3"
     level: str = ""    # 音质档位 key，空表示未知来源
+    source: str = ""   # 来源：ncm / web / meting / outer
+    fee: int = 0       # 1=VIP 歌曲 4=付费专辑，0/8=免费（用于卡片 VIP 标记）
+
+    @property
+    def is_vip_song(self) -> bool:
+        return self.fee in (1, 4)
 
     @property
     def size_mb(self) -> float:
@@ -80,6 +92,10 @@ class PlayInfo:
     def quality_str(self) -> str:
         if self.level in QUALITY_LEVELS:
             return QUALITY_LEVELS[self.level][0]
+        if self.source == "meting":
+            return "Meting 镜像"
+        if self.source == "outer":
+            return "官方外链"
         if self.br >= 999000:
             return "无损"
         if self.br > 0:
@@ -125,6 +141,12 @@ class NetEaseAPI:
         self.ncm_api_base = ncm_api_base.rstrip("/") if ncm_api_base else ""
         self.meting_api = meting_api if meting_api else ""
         self.cookie = cookie or ""
+        # 登录态：True/False 已确认，None 未知；点歌提示据此判断
+        self.login_valid: bool | None = None
+        self.vip: bool = False
+        self._login_check_ts: float = 0.0
+        # 上一次取播放地址是否因「试听片段」降级（"" / "trial"）
+        self.last_fallback: str = ""
         # DummyCookieJar：禁用会话自动存/发 Cookie。
         # 否则登录接口 Set-Cookie 会被 CookieJar 记住，与手动传入的 Cookie 头叠加，
         # 可能出现重复/过期 MUSIC_U，导致会员鉴权时好时坏（VIP 歌偶尔变 30 秒试听）。
@@ -197,13 +219,22 @@ class NetEaseAPI:
 
     # ---------- 播放地址 ----------
 
+    @staticmethod
+    def _is_trial(d: dict) -> bool:
+        """响应带 freeTrialInfo = 返回的是 30 秒试听片段（登录失效/未登录/非会员）。
+        此类 URL 绝不当作成功，否则用户收到的永远是试听部分。"""
+        return bool(d.get("freeTrialInfo"))
+
     async def get_play_info(self, song_id: int, quality: str) -> PlayInfo | None:
-        """按音质档位获取播放地址，逐级回退"""
+        """按音质档位获取播放地址，逐级回退；遇到试听片段自动复核登录态并降级 Meting"""
         prefer = QUALITY_LEVELS.get(quality, QUALITY_LEVELS["exhigh"])
+        self.last_fallback = ""
 
         # 1. NeteaseCloudMusicApi 服务（支持登录 cookie，可到母带级）
         if self.ncm_api_base:
             levels = list(dict.fromkeys([prefer[2], *LEVEL_FALLBACK]))
+            trial = False
+            trial_fee = 0
             for lv in levels:
                 try:
                     # timestamp 破缓存：服务端 apicache 按 URL 缓存、不区分 Cookie，
@@ -214,16 +245,32 @@ class NetEaseAPI:
                         params={"id": song_id, "level": lv, "timestamp": self._ts()},
                     )
                     d = (result.get("data") or [{}])[0]
-                    if d.get("url"):
-                        return PlayInfo(
-                            url=d["url"],
-                            br=d.get("br", 0),
-                            size=d.get("size", 0),
-                            ext=(d.get("type") or "mp3").lower(),
-                            level=lv,
+                    if not d.get("url"):
+                        continue
+                    if self._is_trial(d):
+                        # 试听片段：换档位也是试听，立即复核登录态并跳出，降级镜像
+                        logger.warning(
+                            f"[ncm_player] 歌曲 {song_id} 仅返回试听片段"
+                            f"（freeTrialInfo），登录态失效或账号非会员，自动降级镜像"
                         )
+                        trial = True
+                        trial_fee = int(d.get("fee", 0) or 0)
+                        await self.probe_login()
+                        break
+                    return PlayInfo(
+                        url=d["url"],
+                        br=d.get("br", 0),
+                        size=d.get("size", 0),
+                        ext=(d.get("type") or "mp3").lower(),
+                        level=lv,
+                        source="ncm",
+                        fee=int(d.get("fee", 0) or 0),
+                    )
                 except Exception as e:
                     logger.warning(f"[ncm_player] ncm_api 取地址失败(level={lv}): {e}")
+            if trial:
+                # 官方网页接口无登录态同样只会给试听，直接进入 Meting 镜像
+                return self._meting_or_outer(song_id, reason="trial", fee=trial_fee)
 
         # 2. 官方网页接口，按码率回退
         brs = sorted(
@@ -236,17 +283,34 @@ class NetEaseAPI:
                     self.PLAY_URL, params={"ids": f"[{song_id}]", "br": br}
                 )
                 data = (result.get("data") or [{}])[0]
-                if data.get("url"):
-                    return PlayInfo(
-                        url=data["url"],
-                        br=data.get("br", br),
-                        size=data.get("size", 0),
-                        ext=(data.get("type") or "mp3").lower(),
+                if not data.get("url"):
+                    continue
+                if self._is_trial(data):
+                    logger.warning(
+                        f"[ncm_player] 歌曲 {song_id} 官方接口仅返回试听片段，自动降级镜像"
                     )
+                    await self.probe_login()
+                    return self._meting_or_outer(
+                        song_id, reason="trial", fee=int(data.get("fee", 0) or 0)
+                    )
+                return PlayInfo(
+                    url=data["url"],
+                    br=data.get("br", br),
+                    size=data.get("size", 0),
+                    ext=(data.get("type") or "mp3").lower(),
+                    source="web",
+                    fee=int(data.get("fee", 0) or 0),
+                )
             except Exception as e:
                 logger.warning(f"[ncm_player] 官方接口取地址失败(br={br}): {e}")
 
-        # 3. Meting 镜像
+        # 3/4. Meting 镜像 → 官方外链兜底
+        return self._meting_or_outer(song_id)
+
+    def _meting_or_outer(self, song_id: int, reason: str = "", fee: int = 0) -> PlayInfo:
+        """Meting 镜像 → 官方外链。reason='trial' 表示因试听片段降级；fee 透传 VIP 标记"""
+        if reason == "trial":
+            self.last_fallback = "trial"
         if self.meting_api:
             sep = "&" if "?" in self.meting_api else "?"
             return PlayInfo(
@@ -254,11 +318,12 @@ class NetEaseAPI:
                 br=0,
                 size=0,
                 ext="mp3",
+                source="meting",
+                fee=fee,
             )
-
-        # 4. 兜底：官方外链（VIP/无版权歌曲可能 404）
         return PlayInfo(
-            url=f"{self.OUTER_URL}?id={song_id}.mp3", br=0, size=0, ext="mp3"
+            url=f"{self.OUTER_URL}?id={song_id}.mp3", br=0, size=0, ext="mp3",
+            source="outer", fee=fee,
         )
 
     # ---------- 热评 / 歌词 ----------
@@ -349,21 +414,46 @@ class NetEaseAPI:
                 cookie = "; ".join(pairs)
             return int(result.get("code", 0)), cookie
 
-    async def check_login(self) -> bool:
-        """校验当前 cookie 是否仍有效（用于启动时提示登录状态）"""
+    # 登录态复核防抖间隔（秒）：避免每首 VIP 歌都重复打 /login/status
+    LOGIN_CHECK_INTERVAL = 60
+
+    async def probe_login(self, force: bool = False) -> bool:
+        """复核登录态与会员身份，维护 login_valid / vip。返回当前登录是否有效。
+
+        - 明确响应（有/无 account）才会翻转状态；网络异常保留既有状态，
+          避免一次抖动把「已登录」误判成「失效」导致误报提示。
+        - 60 秒防抖（force=True 强制复核，用于扫码登录成功后立即确认）。
+        """
         if not self.ncm_api_base or not self.cookie:
+            self.login_valid = False
+            self.vip = False
             return False
+        if not force and time.time() - self._login_check_ts < self.LOGIN_CHECK_INTERVAL:
+            return bool(self.login_valid)
+        self._login_check_ts = time.time()
         try:
             result = await self._get(
                 f"{self.ncm_api_base}/login/status",
                 auth=True,
                 params={"timestamp": self._ts()},
             )
-            account = (result.get("data") or {}).get("account")
-            return bool(account and account.get("id"))
+            # 兼容两种响应结构：{data:{account,profile}} 或顶层 {account,profile}
+            data = result.get("data") or result
+            account = data.get("account") or {}
+            profile = data.get("profile") or {}
+            self.login_valid = bool(account.get("id"))
+            self.vip = bool(profile.get("vipType"))
+            if not self.login_valid:
+                logger.warning(
+                    "[ncm_player] 登录复核：cookie 已失效（接口未返回账号信息）"
+                )
         except Exception as e:
-            logger.warning(f"[ncm_player] 登录状态校验失败: {e}")
-            return False
+            logger.warning(f"[ncm_player] 登录状态校验失败（保留原状态）: {e}")
+        return bool(self.login_valid)
+
+    async def check_login(self) -> bool:
+        """校验当前 cookie 是否仍有效（用于启动时提示登录状态）"""
+        return await self.probe_login(force=True)
 
     # ---------- 下载 ----------
 
