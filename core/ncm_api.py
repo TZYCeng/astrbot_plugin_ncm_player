@@ -145,10 +145,11 @@ class NetEaseAPI:
         self.login_valid: bool | None = None
         self.vip: bool = False
         self._login_check_ts: float = 0.0
-        # 已登录账号信息（用于登录结果提示登的是哪个账号）
+        # 已登录账号信息（用于登录结果提示）
+        self.account_uid: str = ""
         self.account_user_name: str = ""
-        # True = 已登录但 /user/detail 查无此人（游客/异常账号，几乎必然登错账号）
         self.account_anomaly: bool = False
+        self.login_detail_code: int | None = None
         # 上一次取播放地址是否因「试听片段」降级（"" / "trial"）
         self.last_fallback: str = ""
         # DummyCookieJar：禁用会话自动存/发 Cookie。
@@ -165,16 +166,22 @@ class NetEaseAPI:
 
     def set_cookie(self, cookie: str):
         self.cookie = cookie or ""
+        self.login_valid = None
+        self.vip = False
+        self.account_uid = ""
+        self.account_user_name = ""
+        self.account_anomaly = False
+        self.login_detail_code = None
+        self._login_check_ts = 0.0
 
-    def _auth_headers(self) -> dict:
+    def _auth_headers(self, cookie: str | None = None) -> dict:
         h = dict(self.HEADERS)
-        h["Cookie"] = (
-            f"appver=2.0.2; {self.cookie}" if self.cookie else "appver=2.0.2"
-        )
+        value = self.cookie if cookie is None else cookie
+        h["Cookie"] = f"appver=2.0.2; {value}" if value else "appver=2.0.2"
         return h
 
-    async def _get(self, url: str, auth: bool = False, **kwargs):
-        headers = self._auth_headers() if auth else None
+    async def _get(self, url: str, auth: bool = False, cookie: str | None = None, **kwargs):
+        headers = self._auth_headers(cookie) if auth else None
         async with self.session.get(
             url, proxy=self.proxy, headers=headers, **kwargs
         ) as resp:
@@ -396,23 +403,26 @@ class NetEaseAPI:
     async def qr_check(self, key: str) -> tuple[int, str]:
         """轮询扫码状态。返回 (code, cookie)。800 过期 801 等待 802 待确认 803 成功。
 
-        cookie 优先取响应体；部分版本只在 Set-Cookie 响应头里返回，做兜底合并，
+        只在 803 时提取新 Cookie；响应体优先，补充 Set-Cookie 中缺少的字段，
         避免登录成功却拿到空 cookie（表现为重启/刷新后"掉登录"）。
         """
         async with self.session.get(
             f"{self.ncm_api_base}/login/qr/check",
             proxy=self.proxy,
-            headers=self._auth_headers(),
+            headers=self._auth_headers(""),
             params={"key": key, "timestamp": self._ts()},
         ) as resp:
             resp.raise_for_status()
             result = await resp.json(content_type=None)
+            code = int(result.get("code", 0))
+            if code != 803:
+                return code, ""
             cookie = result.get("cookie", "") or ""
-            if not cookie:
-                raw = resp.headers.getall("Set-Cookie", [])
-                pairs = [c.split(";", 1)[0] for c in raw if "=" in c.split(";", 1)[0]]
-                cookie = "; ".join(pairs)
-            return int(result.get("code", 0)), cookie
+            raw = resp.headers.getall("Set-Cookie", [])
+            pairs = [c.split(";", 1)[0].strip() for c in raw if "=" in c.split(";", 1)[0]]
+            existing = {part.strip().partition("=")[0] for part in cookie.split(";")}
+            cookie = "; ".join([cookie, *(p for p in pairs if p.partition("=")[0] not in existing)]).strip("; ")
+            return code, cookie
 
     # 登录态复核防抖间隔（秒）：避免每首 VIP 歌都重复打 /login/status
     LOGIN_CHECK_INTERVAL = 60
@@ -427,6 +437,10 @@ class NetEaseAPI:
         if not self.ncm_api_base or not self.cookie:
             self.login_valid = False
             self.vip = False
+            self.account_uid = ""
+            self.account_user_name = ""
+            self.account_anomaly = False
+            self.login_detail_code = None
             return False
         if not force and time.time() - self._login_check_ts < self.LOGIN_CHECK_INTERVAL:
             return bool(self.login_valid)
@@ -441,9 +455,11 @@ class NetEaseAPI:
             data = result.get("data") or result
             account = data.get("account") or {}
             profile = data.get("profile") or {}
-            self.login_valid = bool(account.get("id"))
-            self.account_user_name = str(account.get("userName") or "")
-            self.account_anomaly = False
+            login_valid = bool(account.get("id"))
+            account_uid = str(account.get("id") or "")
+            account_user_name = str(account.get("userName") or profile.get("nickname") or "")
+            account_anomaly = False
+            login_detail_code = None
             # VIP 判定取三个来源的最大值：
             # 1) login/status 的 account.vipType（账号对象自带该字段）
             # 2) login/status 的 profile.vipType（轻量接口经常不返回）
@@ -454,7 +470,7 @@ class NetEaseAPI:
             )
             detail_vip_type: int | None = None
             detail_code: int | None = None
-            if self.login_valid and not vip_type:
+            if login_valid and not vip_type:
                 try:
                     detail = await self._get(
                         f"{self.ncm_api_base}/user/detail",
@@ -462,33 +478,35 @@ class NetEaseAPI:
                         params={"uid": account["id"], "timestamp": self._ts()},
                     )
                     detail_code = detail.get("code")
-                    # 已登录但用户系统查无此人：游客/异常账号，基本可断定登错账号
-                    if detail_code and int(detail_code) != 200:
-                        self.account_anomaly = True
+                    login_detail_code = detail_code
+                    if detail_code is not None and int(detail_code) != 200:
+                        account_anomaly = True
                     detail_vip_type = int(
                         (detail.get("profile") or {}).get("vipType") or 0
                     )
                     vip_type = max(vip_type, detail_vip_type)
                 except Exception as e:
                     logger.warning(f"[ncm_player] 获取用户详情失败（按非 VIP 处理）: {e}")
+            self.login_valid = login_valid
+            self.account_uid = account_uid
+            self.account_user_name = account_user_name
+            self.account_anomaly = account_anomaly
+            self.login_detail_code = login_detail_code
             self.vip = bool(vip_type)
-            # 诊断日志：同时证明插件版本已生效，并暴露各来源的 vipType 原始值
             logger.info(
-                f"[ncm_player] 登录复核完成(v1.4.7)：uid={account.get('id')}, "
-                f"userName={account.get('userName')}, "
+                f"[ncm_player] 登录复核：uid={account_uid or '无'}, "
                 f"account.vipType={account.get('vipType')}, "
                 f"profile.vipType={profile.get('vipType')}, "
                 f"user/detail.code={detail_code if detail_code is not None else '未查询'}, "
                 f"user/detail.vipType={detail_vip_type if detail_vip_type is not None else '未查询'}, "
-                f"最终判定={'VIP' if self.vip else '非 VIP'}"
+                f"VIP字段判定={'是' if self.vip else '否'}"
             )
-            if self.account_anomaly:
+            if account_anomaly:
                 logger.warning(
-                    f"[ncm_player] 已登录账号 uid={account.get('id')} 在网易云用户系统中"
-                    "查无此人（user/detail 404），极可能是游客/小号——"
-                    "请确认扫码时网易云 App 当前登录的是 SVIP 账号后重新扫码"
+                    f"[ncm_player] uid={account_uid} 的 user/detail 返回 {detail_code}，"
+                    "该结果不能单独证明账号归属或会员状态，请核对 App UID 与服务来源"
                 )
-            if not self.login_valid:
+            if not login_valid:
                 logger.warning(
                     "[ncm_player] 登录复核：cookie 已失效（接口未返回账号信息）"
                 )
