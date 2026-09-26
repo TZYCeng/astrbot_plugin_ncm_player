@@ -1,5 +1,11 @@
 # 更新日志 (CHANGELOG)
 
+## [v1.4.6] - VIP 判定三来源取最大 + 登录复核诊断日志
+
+*   **🐛 【修复】部分账号 v1.4.5 仍被误判为非 VIP**：
+    *   登录复核的 VIP 判定改为三来源取最大值：`/login/status` 的 `account.vipType`（账号对象自带，此前漏读）、`profile.vipType`、`/user/detail` 完整资料的 `vipType`，任一来源大于 0 即判定为 VIP。
+*   **✨ 【新增】登录复核诊断日志**：每次复核输出 `登录复核完成(v1.4.6)：uid=…, account.vipType=…, profile.vipType=…, user/detail.vipType=…, 最终判定=…`，日志中各来源的原始值一目了然，也便于确认新版本是否已生效。
+
 ## [v1.4.5] - 修复 SVIP 账号被误判为非 VIP
 
 *   **🐛 【修复】黑胶 VIP/SVIP 账号登录后被提示「该账号不是 VIP」**：
