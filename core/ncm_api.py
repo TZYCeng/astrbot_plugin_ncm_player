@@ -145,6 +145,10 @@ class NetEaseAPI:
         self.login_valid: bool | None = None
         self.vip: bool = False
         self._login_check_ts: float = 0.0
+        # 已登录账号信息（用于登录结果提示登的是哪个账号）
+        self.account_user_name: str = ""
+        # True = 已登录但 /user/detail 查无此人（游客/异常账号，几乎必然登错账号）
+        self.account_anomaly: bool = False
         # 上一次取播放地址是否因「试听片段」降级（"" / "trial"）
         self.last_fallback: str = ""
         # DummyCookieJar：禁用会话自动存/发 Cookie。
@@ -438,6 +442,8 @@ class NetEaseAPI:
             account = data.get("account") or {}
             profile = data.get("profile") or {}
             self.login_valid = bool(account.get("id"))
+            self.account_user_name = str(account.get("userName") or "")
+            self.account_anomaly = False
             # VIP 判定取三个来源的最大值：
             # 1) login/status 的 account.vipType（账号对象自带该字段）
             # 2) login/status 的 profile.vipType（轻量接口经常不返回）
@@ -447,6 +453,7 @@ class NetEaseAPI:
                 int(profile.get("vipType") or 0),
             )
             detail_vip_type: int | None = None
+            detail_code: int | None = None
             if self.login_valid and not vip_type:
                 try:
                     detail = await self._get(
@@ -454,6 +461,10 @@ class NetEaseAPI:
                         auth=True,
                         params={"uid": account["id"], "timestamp": self._ts()},
                     )
+                    detail_code = detail.get("code")
+                    # 已登录但用户系统查无此人：游客/异常账号，基本可断定登错账号
+                    if detail_code and int(detail_code) != 200:
+                        self.account_anomaly = True
                     detail_vip_type = int(
                         (detail.get("profile") or {}).get("vipType") or 0
                     )
@@ -463,12 +474,20 @@ class NetEaseAPI:
             self.vip = bool(vip_type)
             # 诊断日志：同时证明插件版本已生效，并暴露各来源的 vipType 原始值
             logger.info(
-                f"[ncm_player] 登录复核完成(v1.4.6)：uid={account.get('id')}, "
+                f"[ncm_player] 登录复核完成(v1.4.7)：uid={account.get('id')}, "
+                f"userName={account.get('userName')}, "
                 f"account.vipType={account.get('vipType')}, "
                 f"profile.vipType={profile.get('vipType')}, "
+                f"user/detail.code={detail_code if detail_code is not None else '未查询'}, "
                 f"user/detail.vipType={detail_vip_type if detail_vip_type is not None else '未查询'}, "
                 f"最终判定={'VIP' if self.vip else '非 VIP'}"
             )
+            if self.account_anomaly:
+                logger.warning(
+                    f"[ncm_player] 已登录账号 uid={account.get('id')} 在网易云用户系统中"
+                    "查无此人（user/detail 404），极可能是游客/小号——"
+                    "请确认扫码时网易云 App 当前登录的是 SVIP 账号后重新扫码"
+                )
             if not self.login_valid:
                 logger.warning(
                     "[ncm_player] 登录复核：cookie 已失效（接口未返回账号信息）"

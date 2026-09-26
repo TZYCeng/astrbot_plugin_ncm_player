@@ -24,11 +24,19 @@ LISTEN_TRIGGERS = ["我要听", "我想听", "想听", "听歌", "点歌", "来�
 LISTEN_PATTERN = "(" + "|".join(LISTEN_TRIGGERS) + ")"
 
 
+def _mask_name(s: str) -> str:
+    """账号名打码：保留首尾，中间用 * 代替（userName 可能是手机号）"""
+    s = s.strip()
+    if len(s) <= 2:
+        return s
+    return s[:2] + "***" + s[-2:]
+
+
 @register(
     "astrbot_plugin_ncm_player",
     "Kimi",
     "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码登录、内置 NeteaseCloudMusicApi 服务",
-    "1.4.6",
+    "1.4.7",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -488,15 +496,31 @@ class NcmPlayerPlugin(Star):
                 # 立即复核登录态与会员身份，并重置失效提示节流
                 self._invalid_notice_ts = 0.0
                 await self.api.probe_login(force=True)
+                # 登录结果里带上当前登录账号，方便用户确认是否登错账号
+                acct_desc = ""
+                if self.api.account_user_name:
+                    acct_desc = f"（当前登录账号：{_mask_name(self.api.account_user_name)}）"
                 if self.api.login_valid and self.api.vip:
                     await event.send(
-                        event.plain_result("✅ 网易云登录成功（VIP 账号），已解锁会员音质")
+                        event.plain_result(
+                            f"✅ 网易云登录成功{acct_desc}（VIP 账号），已解锁会员音质"
+                        )
+                    )
+                elif self.api.login_valid and self.api.account_anomaly:
+                    await event.send(
+                        event.plain_result(
+                            f"⚠️ 登录成功，但这个账号在网易云用户系统中查无资料{acct_desc}"
+                            "——极可能是游客账号或登错账号了。\n"
+                            "请在网易云 App「我的」页面确认当前登录的是你的 SVIP 账号"
+                            "（必要时退出重新登录），再用 /网易云登录 扫码"
+                        )
                     )
                 elif self.api.login_valid:
                     await event.send(
                         event.plain_result(
-                            "✅ 网易云登录成功，但该账号不是 VIP，"
-                            "会员歌曲仍会只能试听并自动降级到 Meting 镜像"
+                            f"✅ 网易云登录成功{acct_desc}，但该账号不是 VIP，"
+                            "会员歌曲仍会只能试听并自动降级到 Meting 镜像。"
+                            "若你确认账号有会员，请检查 App 当前登录的账号后再扫码"
                         )
                     )
                 else:
