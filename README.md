@@ -1,6 +1,10 @@
 # 网易云点歌 · astrbot_plugin_ncm_player
 
-为 AstrBot 设计的网易云点歌插件，之前用的https://github.com/Zhalslar/astrbot_plugin_music 每次点歌都超时，语音都发不出来，于是按照这个插件的思路让kimi K3写了这个插件：
+为 AstrBot 设计的网易云点歌插件，之前用的https://github.com/Zhalslar/astrbot_plugin_music 每次点歌都超时，语音都发不出来，于是按照这个插件的思路写了这个插件
+[![Version](https://img.shields.io/badge/version-v1.4.9-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_ncm_player)
+[![Python](https://img.shields.io/badge/python-3.8+-green.svg)](https://www.python.org/)
+[![AstrBot](https://img.shields.io/badge/AstrBot-4.9+-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
+[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 - **双通道点歌**：LLM 工具自然语言点歌 + 关键词监听兜底
 - **发送方式自定义**：语音优先自动降级、只发语音、只发文件、只发卡片、或语音+文件+卡片一起发
