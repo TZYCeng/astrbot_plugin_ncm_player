@@ -13,6 +13,7 @@ https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/releases
 """
 
 import asyncio
+import os
 import platform
 import shutil
 import stat
@@ -200,11 +201,10 @@ class EmbeddedNcmServer:
 
         self.dir.mkdir(parents=True, exist_ok=True)  # 作为进程工作目录
         exe = self._ensure_executable()
-        env = {
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-            "PORT": str(self.port),
-            "HOST": "127.0.0.1",
-        }
+        # 继承父进程环境再覆盖服务配置：此前直接替换整个 env，
+        # Windows 下缺 SystemRoot/TEMP 会导致二进制秒退 (code=1)。
+        env = dict(os.environ)
+        env.update({"PORT": str(self.port), "HOST": "127.0.0.1"})
         self.process = await asyncio.create_subprocess_exec(
             str(exe),
             stdout=asyncio.subprocess.DEVNULL,

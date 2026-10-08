@@ -11,7 +11,14 @@ from astrbot.api.message_components import Image, Node, Nodes, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
-from .core.ncm_api import NetEaseAPI, PlayInfo, Song, normalize_quality
+from .core.ncm_api import (
+    NetEaseAPI,
+    PlayInfo,
+    Song,
+    cookie_keys,
+    has_music_u,
+    normalize_quality,
+)
 from .core.ncm_server import EmbeddedNcmServer
 from .core.renderer import CardRenderer
 from .core.sender import SongSender
@@ -38,7 +45,7 @@ def _mask_name(s: str) -> str:
     "astrbot_plugin_ncm_player",
     "Kimi",
     "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码/短信验证码登录、内置 NeteaseCloudMusicApi 服务",
-    "1.4.9",
+    "1.4.10",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -125,12 +132,21 @@ class NcmPlayerPlugin(Star):
 
     # ---------- 内部流程 ----------
 
+    @staticmethod
+    def _pend_key(event: AstrMessageEvent) -> str:
+        """选歌状态键：同一群聊中不同用户各自独立，避免 A 选歌时 B 的回复串台"""
+        try:
+            sender = str(event.get_sender_id())
+        except Exception:
+            sender = ""
+        return f"{event.unified_msg_origin}#{sender}"
+
     def _get_pending(self, event: AstrMessageEvent) -> list[Song] | None:
-        item = self.pending.get(event.unified_msg_origin)
+        item = self.pending.get(self._pend_key(event))
         if item and time.time() - item[0] < PENDING_EXPIRE:
             return item[1]
         if item:
-            self.pending.pop(event.unified_msg_origin, None)
+            self.pending.pop(self._pend_key(event), None)
         return None
 
     def _clear_pending(self, origin: str, songs: list[Song]):
@@ -162,7 +178,7 @@ class NcmPlayerPlugin(Star):
             )
             await event.send(event.plain_result(f"🎵 搜索结果：\n{text}\n回复序号点歌"))
 
-        origin = event.unified_msg_origin
+        origin = self._pend_key(event)
         self.pending[origin] = (time.time(), songs)
         return songs
 
@@ -344,7 +360,7 @@ class NcmPlayerPlugin(Star):
             songs = self._get_pending(event)
             if songs and 1 <= index <= len(songs):
                 song = songs[index - 1]
-                self._clear_pending(event.unified_msg_origin, songs)
+                self._clear_pending(self._pend_key(event), songs)
             elif not song_name:
                 return "选歌列表已过期或序号无效，请重新搜索"
         if song is None:
@@ -395,7 +411,7 @@ class NcmPlayerPlugin(Star):
     @filter.regex(r"^\s*(\d{1,2})\s*$")
     async def pick_by_number(self, event: AstrMessageEvent):
         """选歌列表待选期间，纯数字消息视为点歌序号"""
-        origin = event.unified_msg_origin
+        origin = self._pend_key(event)
         if origin in self._waiting and self._get_pending(event) is self._waiting[origin]:
             return
         songs = self._get_pending(event)
@@ -423,7 +439,7 @@ class NcmPlayerPlugin(Star):
         if not songs:
             return
 
-        origin = event.unified_msg_origin
+        origin = self._pend_key(event)
         self._waiting[origin] = songs
 
         @session_waiter(timeout=120)
@@ -431,6 +447,12 @@ class NcmPlayerPlugin(Star):
             if self._waiting.get(origin) is not songs:
                 controller.stop()
                 return
+            try:
+                same_user = str(ev.get_sender_id()) == str(event.get_sender_id())
+            except Exception:
+                same_user = False
+            if not same_user:
+                return  # 同一群聊中其他人的消息：不处理也不结束等待
             text = ev.message_str.strip()
             if self._get_pending(ev) is not songs and text not in ("取消", "算了", "不用了"):
                 controller.stop()
@@ -675,11 +697,26 @@ class NcmPlayerPlugin(Star):
 
     async def _save_login(self, cookie: str, candidate: NetEaseAPI,
                           generation: int, method: str) -> str:
+        if not has_music_u(cookie):
+            return "新 Cookie 缺少 MUSIC_U 登录凭证（疑似游客态）；原登录态未更改，请重新扫码"
         try:
             valid = await candidate.probe_login(force=True)
         except Exception:
             valid = False
         if not valid or not candidate.account_uid:
+            reason = candidate.last_invalid_reason
+            if reason == "guest":
+                return (
+                    "新 Cookie 复核为游客/匿名会话（非账号登录），原登录态未更改；"
+                    "请确认网易云 App 上登录的是要绑定的账号后重新扫码"
+                )
+            if reason == "mismatch":
+                return (
+                    "新 Cookie 复核发现 account 与 profile 不是同一用户"
+                    "（疑似接口缓存串号），原登录态未更改；请稍等片刻后重新扫码"
+                )
+            if reason == "bad_code":
+                return "新 Cookie 未通过独立 UID 复核（接口返回异常）；原登录态未更改，请检查服务后重试"
             return "新 Cookie 未通过独立 UID 复核；原登录态未更改，请检查服务或重试"
         async with self._login_lock:
             if generation != self._login_generation:
@@ -698,16 +735,23 @@ class NcmPlayerPlugin(Star):
                     logger.warning("[ncm_player] 临时 Cookie 文件清理失败")
             self.api.set_cookie(cookie)
             self.api.login_valid = True
+            self.api.last_invalid_reason = ""
             self.api.vip = candidate.vip
             self.api.account_uid = candidate.account_uid
+            self.api.account_nickname = candidate.account_nickname
             self.api.account_user_name = candidate.account_user_name
             self.api.account_anomaly = candidate.account_anomaly
             self.api.login_detail_code = candidate.login_detail_code
             self.api._login_check_ts = time.time()
             self._invalid_notice_ts = 0.0
-        name = ""
-        if method == "扫码" and candidate.account_user_name:
-            name = f"，昵称/用户名：{_mask_name(candidate.account_user_name)}"
+        # 昵称是公开信息，不打码展示，方便对照 App 确认是否登对账号；
+        # userName 可能是手机号，仍打码。
+        if candidate.account_nickname:
+            name = f"，昵称：{candidate.account_nickname.strip()}"
+        elif candidate.account_user_name:
+            name = f"，用户名：{_mask_name(candidate.account_user_name)}"
+        else:
+            name = ""
         status = "VIP 字段已确认" if candidate.vip else "未从接口确认 VIP 身份"
         detail = (f"；user/detail 返回 {candidate.login_detail_code}，不能据此断定登错账号"
                   if candidate.account_anomaly else "")
@@ -728,6 +772,9 @@ class NcmPlayerPlugin(Star):
             qrimg = await self.api.qr_create(key)
             qr_path = self.cache_dir / f"login_qr_{uuid.uuid4().hex}.png"
             qr_path.write_bytes(base64.b64decode(qrimg.split(",", 1)[1]))
+            prev_qr, self._active_qr_path = self._active_qr_path, qr_path
+            if prev_qr and prev_qr != qr_path:
+                self._expire_qr(prev_qr)
             if generation != self._login_generation:
                 self._expire_qr(qr_path)
                 return "登录已被退出登录操作取消；请重新发起扫码"
@@ -762,12 +809,17 @@ class NcmPlayerPlugin(Star):
                 await event.send(event.plain_result("扫码成功，请在网易云音乐 App 上点击确认登录"))
             if code != 803:
                 continue
-            if not cookie or not cookie.strip() or not any(
-                part.strip().partition("=")[0] in ("MUSIC_U", "MUSIC_A")
-                and part.strip().partition("=")[2].strip()
-                for part in cookie.split(";")
-            ):
-                return "扫码已确认，但服务没有返回可用的新认证 Cookie；原登录态未更改，请检查 API 服务后重试"
+            if not has_music_u(cookie):
+                # 典型坑：服务只下发游客态 Cookie（仅 MUSIC_A），此时扫码看似
+                # 成功，复核却得到同一个游客账号。必须拒绝，不能保存。
+                logger.warning(
+                    "[ncm_player] 扫码已确认，但新 Cookie 缺少 MUSIC_U 登录凭证"
+                    f"(cookie_keys={cookie_keys(cookie)})；疑似游客态，原登录态未更改"
+                )
+                return (
+                    "扫码已确认，但服务仅返回游客态 Cookie（缺少 MUSIC_U 登录凭证），"
+                    "原登录态未更改；请确认 App 上登录的是要绑定的账号后重新扫码"
+                )
             candidate = NetEaseAPI(
                 proxy=self.cfg.get("http_proxy", ""),
                 ncm_api_base=self.api.ncm_api_base,

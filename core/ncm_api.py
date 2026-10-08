@@ -113,6 +113,26 @@ class Comment:
 
 _LRC_TAG = re.compile(r"\[[^\]]*\]")
 
+# MUSIC_U 是账号登录的唯一有效凭证；MUSIC_A 只是游客/匿名 token，
+# 绝不能单独作为“已登录”依据（扫码确认后服务偶发只下发游客态 Cookie，
+# 若误收下，两次扫码会复核出同一个游客账号：同 UID、无 VIP）。
+_MUSIC_U_RE = re.compile(r"(?:^|;)\s*MUSIC_U=[^;\s]+")
+
+
+def has_music_u(cookie: str) -> bool:
+    """Cookie 是否携带有效登录凭证 MUSIC_U"""
+    return bool(cookie and _MUSIC_U_RE.search(cookie))
+
+
+def cookie_keys(cookie: str) -> list[str]:
+    """Cookie 中的 key 名列表（仅名不含值，可安全进日志，用于诊断登录问题）"""
+    keys: list[str] = []
+    for part in (cookie or "").split(";"):
+        name = part.strip().partition("=")[0].strip()
+        if name and name not in keys:
+            keys.append(name)
+    return keys
+
 
 class NetEaseAPI:
     SEARCH_URL = "https://music.163.com/api/search/get/web"
@@ -147,9 +167,13 @@ class NetEaseAPI:
         self._login_check_ts: float = 0.0
         # 已登录账号信息（用于登录结果提示）
         self.account_uid: str = ""
+        self.account_nickname: str = ""
         self.account_user_name: str = ""
         self.account_anomaly: bool = False
         self.login_detail_code: int | None = None
+        # 最近一次复核判无效的原因（"" / "no_credential" / "bad_code" / "guest" /
+        # "no_account" / "mismatch"），供调用方给出针对性提示
+        self.last_invalid_reason: str = ""
         # 上一次取播放地址是否因「试听片段」降级（"" / "trial"）
         self.last_fallback: str = ""
         # DummyCookieJar：禁用会话自动存/发 Cookie。
@@ -164,20 +188,30 @@ class NetEaseAPI:
     async def close(self):
         await self.session.close()
 
-    def set_cookie(self, cookie: str):
-        self.cookie = cookie or ""
-        self.login_valid = None
+    def _mark_invalid(self, reason: str = ""):
+        """登录态置为无效并清空账号信息（网络异常时不要调此函数，保留原状态）"""
+        self.login_valid = False
         self.vip = False
         self.account_uid = ""
+        self.account_nickname = ""
         self.account_user_name = ""
         self.account_anomaly = False
         self.login_detail_code = None
+        self.last_invalid_reason = reason
+
+    def set_cookie(self, cookie: str):
+        self.cookie = cookie or ""
+        self._mark_invalid()
         self._login_check_ts = 0.0
 
     def _auth_headers(self, cookie: str | None = None) -> dict:
         h = dict(self.HEADERS)
         value = self.cookie if cookie is None else cookie
         h["Cookie"] = f"appver=2.0.2; {value}" if value else "appver=2.0.2"
+        # 登录相关请求禁缓存：NeteaseCloudMusicApi 的 apicache 按 URL 缓存响应，
+        # 鉴权类接口一旦命中旧缓存就会串号/复核错账号
+        h["Cache-Control"] = "no-cache"
+        h["Pragma"] = "no-cache"
         return h
 
     async def _get(self, url: str, auth: bool = False, cookie: str | None = None, **kwargs):
@@ -462,9 +496,7 @@ class NetEaseAPI:
                          for part in resp.headers.getall("Set-Cookie", [])]
                 cookie = "; ".join([cookie, *(part for part in pairs
                                            if "=" in part and part.partition("=")[0] not in existing)]).strip("; ")
-                if not any(part.strip().partition("=")[0] in ("MUSIC_U", "MUSIC_A")
-                           and part.strip().partition("=")[2].strip()
-                           for part in cookie.split(";")):
+                if not has_music_u(cookie):
                     raise ValueError("服务未返回可用的新认证 Cookie；原登录态未更改")
                 return cookie
         except Exception:
@@ -479,14 +511,13 @@ class NetEaseAPI:
         - 明确响应（有/无 account）才会翻转状态；网络异常保留既有状态，
           避免一次抖动把「已登录」误判成「失效」导致误报提示。
         - 60 秒防抖（force=True 强制复核，用于扫码登录成功后立即确认）。
+        - 有效登录必须同时满足：Cookie 含 MUSIC_U（MUSIC_A 只是游客 token）、
+          接口 code 为 200、account 非游客(anonimous)、account.id 与
+          profile.userId 为同一用户。任一不满足即判无效，绝不把游客会话
+          或串号的缓存响应存成登录态。
         """
-        if not self.ncm_api_base or not self.cookie:
-            self.login_valid = False
-            self.vip = False
-            self.account_uid = ""
-            self.account_user_name = ""
-            self.account_anomaly = False
-            self.login_detail_code = None
+        if not self.ncm_api_base or not has_music_u(self.cookie):
+            self._mark_invalid("no_credential")
             return False
         if not force and time.time() - self._login_check_ts < self.LOGIN_CHECK_INTERVAL:
             return bool(self.login_valid)
@@ -499,11 +530,50 @@ class NetEaseAPI:
             )
             # 兼容两种响应结构：{data:{account,profile}} 或顶层 {account,profile}
             data = result.get("data") or result
+            status_code = data.get("code")
             account = data.get("account") or {}
             profile = data.get("profile") or {}
-            login_valid = bool(account.get("id"))
+            keys = cookie_keys(self.cookie)
+            if status_code is not None and int(status_code) != 200:
+                self._mark_invalid("bad_code")
+                logger.warning(
+                    f"[ncm_player] 登录复核：接口返回 code={status_code}，"
+                    f"判为未登录(cookie_keys={keys})"
+                )
+                return False
+            if account.get("anonimous") or account.get("anonymous"):
+                # 游客/匿名会话：扫码只拿到游客态 Cookie 时走这里。
+                # 此前版本误判为有效登录，导致多次扫码复核出同一个游客账号。
+                self._mark_invalid("guest")
+                logger.warning(
+                    "[ncm_player] 登录复核：当前为游客/匿名会话(anonimous)，"
+                    f"非账号登录(cookie_keys={keys})；请重新扫码确认"
+                )
+                return False
             account_uid = str(account.get("id") or "")
-            account_user_name = str(account.get("userName") or profile.get("nickname") or "")
+            profile_uid = str(profile.get("userId") or profile.get("id") or "")
+            nickname = str(profile.get("nickname") or "")
+            if not account_uid:
+                self._mark_invalid("no_account")
+                logger.warning(
+                    f"[ncm_player] 登录复核：cookie 已失效（接口未返回账号信息，"
+                    f"cookie_keys={keys}）"
+                )
+                return False
+            if profile_uid and profile_uid != account_uid:
+                # account 与 profile 不是同一用户：多半是服务端缓存串号。
+                # 拒绝保存，要求重扫，避免“换号扫出旧账号”。
+                self._mark_invalid("mismatch")
+                logger.warning(
+                    f"[ncm_player] 登录复核：account.id={account_uid} 与 "
+                    f"profile.userId={profile_uid} 不一致，疑似接口缓存串号，"
+                    "拒绝保存本次登录态"
+                )
+                return False
+            login_valid = True
+            # 规范 UID 以 profile.userId（App 可见 ID）为准
+            account_uid = profile_uid or account_uid
+            account_user_name = str(account.get("userName") or "")
             account_anomaly = False
             login_detail_code = None
             # VIP 判定取三个来源的最大值：
@@ -516,12 +586,12 @@ class NetEaseAPI:
             )
             detail_vip_type: int | None = None
             detail_code: int | None = None
-            if login_valid and not vip_type:
+            if not vip_type:
                 try:
                     detail = await self._get(
                         f"{self.ncm_api_base}/user/detail",
                         auth=True,
-                        params={"uid": account["id"], "timestamp": self._ts()},
+                        params={"uid": account_uid, "timestamp": self._ts()},
                     )
                     detail_code = detail.get("code")
                     login_detail_code = detail_code
@@ -533,14 +603,17 @@ class NetEaseAPI:
                     vip_type = max(vip_type, detail_vip_type)
                 except Exception:
                     logger.warning("[ncm_player] 获取用户详情失败（按非 VIP 处理）")
-            self.login_valid = login_valid
+            self.login_valid = True
+            self.last_invalid_reason = ""
             self.account_uid = account_uid
+            self.account_nickname = nickname
             self.account_user_name = account_user_name
             self.account_anomaly = account_anomaly
             self.login_detail_code = login_detail_code
             self.vip = bool(vip_type)
             logger.info(
                 f"[ncm_player] 登录复核：uid={account_uid or '无'}, "
+                f"nickname={nickname or '无'}, "
                 f"account.vipType={account.get('vipType')}, "
                 f"profile.vipType={profile.get('vipType')}, "
                 f"user/detail.code={detail_code if detail_code is not None else '未查询'}, "
@@ -551,10 +624,6 @@ class NetEaseAPI:
                 logger.warning(
                     f"[ncm_player] uid={account_uid} 的 user/detail 返回 {detail_code}，"
                     "该结果不能单独证明账号归属或会员状态，请核对 App UID 与服务来源"
-                )
-            if not login_valid:
-                logger.warning(
-                    "[ncm_player] 登录复核：cookie 已失效（接口未返回账号信息）"
                 )
         except Exception:
             logger.warning("[ncm_player] 登录状态校验失败（保留原状态）")

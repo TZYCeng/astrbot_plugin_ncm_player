@@ -8,6 +8,7 @@
 
 import glob
 import math
+import uuid
 from io import BytesIO
 from pathlib import Path
 
@@ -228,6 +229,26 @@ class CardRenderer:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
+    def _save(self, img: Image.Image, prefix: str) -> str:
+        """保存渲染图。文件名带随机串：多人同时点歌不再互相覆盖；
+        同类图片只保留最新的 12 张，旧的自动清理，避免 cache 无限膨胀。"""
+        path = self.out_dir / f"{prefix}_{uuid.uuid4().hex[:8]}.png"
+        img.convert("RGB").save(path, "PNG")
+        try:
+            files = sorted(
+                self.out_dir.glob(f"{prefix}_*.png"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for old in files[12:]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return str(path)
+
     # ---------- 选歌列表 ----------
 
     def render_selection(
@@ -292,9 +313,8 @@ class CardRenderer:
             "回复序号点歌，例如：1", font=f_sub, fill=LIGHT_GRAY, anchor="mm",
         )
 
-        path = self.out_dir / "selection.png"
-        bg.convert("RGB").save(path, "PNG")
-        return str(path)
+        path = self._save(bg, "selection")
+        return path
 
     # ---------- 播放卡片 ----------
 
@@ -361,9 +381,8 @@ class CardRenderer:
             font=f_brand, fill=LIGHT_GRAY, anchor="rs",
         )
 
-        path = self.out_dir / "playing.png"
-        bg.convert("RGB").save(path, "PNG")
-        return str(path)
+        path = self._save(bg, "playing")
+        return path
 
     # ---------- 热评卡片 ----------
 
@@ -433,6 +452,5 @@ class CardRenderer:
                 f"♥ {comment.liked_count}", font=f_sub, fill=ACCENT, anchor="rm",
             )
 
-        path = self.out_dir / "comment.png"
-        bg.convert("RGB").save(path, "PNG")
-        return str(path)
+        path = self._save(bg, "comment")
+        return path
