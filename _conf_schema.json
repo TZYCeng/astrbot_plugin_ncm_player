@@ -1,7 +1,7 @@
 {
     "ncm_api_embedded": {
         "description": "内置 NeteaseCloudMusicApi 服务",
-        "hint": "开启后插件在（重）启动时于本机后台运行官方预编译服务（已随插件打包，无需联网下载，MIT 许可），即可扫码登录、解锁无损/母带音质。默认关闭：不运行任何进程。开启后需重载插件/重启 AstrBot 生效",
+        "hint": "开启并重载插件后，从上游 GitHub Release 下载并校验 API，在 AstrBot 插件数据目录运行。支持扫码登录；音质取决于账号及歌曲权益。与外部 API 独立，可同时开启或关闭。默认关闭",
         "type": "bool",
         "default": false
     },
@@ -12,16 +12,70 @@
         "default": 13000
     },
     "ncm_api_embedded_mirror": {
-        "description": "内置服务下载镜像前缀（仅兜底用）",
-        "hint": "仅当插件包内二进制缺失需联网下载时生效。服务器访问 GitHub 困难时填写加速前缀，如 https://ghfast.top/ ；留空则直连并自动轮换内置镜像。可复用 http_proxy 代理",
+        "description": "兼容旧版：优先 GitHub 加速前缀",
+        "hint": "仅在 GitHub 加速开启时生效，优先于下方地址列表。失败后仍尝试其他加速站和官方地址；留空使用下方列表",
         "type": "string",
         "default": ""
     },
+    "ncm_api_github_acceleration": {
+        "description": "启用 GitHub 下载加速",
+        "hint": "开启时依次尝试加速地址，最后尝试官方 Release；关闭时仅使用 GitHub 官方下载地址。可同时使用 HTTP 代理",
+        "type": "bool",
+        "default": true
+    },
+    "ncm_api_github_accelerators": {
+        "description": "GitHub 加速地址列表",
+        "hint": "按顺序填写支持“前缀/GitHub完整URL”的服务，如 https://ghfast.top/。站点可用性可能变化，可自行增删。所有来源均校验固定版本 SHA-256",
+        "type": "list",
+        "default": ["https://ghfast.top/", "https://gh-proxy.com/"]
+    },
+    "ncm_api_log_output": {
+        "description": "转发 API 输出到 AstrBot 日志",
+        "hint": "默认关闭。开启后将内置 API 的 stdout/stderr 经常见敏感字段脱敏后转发到 AstrBot；启动失败可用 /网易云诊断 查看近期输出。修改后重载插件",
+        "type": "bool",
+        "default": false
+    },
+    "ncm_api_external_enabled": {
+        "description": "启用外部 NeteaseCloudMusicApi",
+        "hint": "与内置服务独立开关；同时开启时先内置、后外部。关闭后即使填写地址也不会调用外部服务",
+        "type": "bool",
+        "default": true
+    },
     "ncm_api_base": {
         "description": "外部 NeteaseCloudMusicApi 服务地址（可选）",
-        "hint": "自己部署的 NeteaseCloudMusicApi 服务根地址，如 http://127.0.0.1:3000。开启「内置服务」后本项被忽略；未开启时配置本项同样支持扫码登录与母带级音质。部署见 https://github.com/neteasecloudmusicapienhanced/api-enhanced",
+        "hint": "自己部署的 API 根地址，如 http://127.0.0.1:3000。启用外部服务后参与回退；留空表示不使用。部署见 https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced",
         "type": "string",
         "default": ""
+    },
+    "ncm_web_enabled": {
+        "description": "启用官方网页音源",
+        "hint": "允许网页 Cookie 账号尝试 API 和网页接口。与内置/外部 API、镜像、官方外链独立；关闭后跳过整个网页 Cookie 音源阶段",
+        "type": "bool",
+        "default": true
+    },
+    "ncm_web_cookie_enabled": {
+        "description": "启用手动网页 Cookie",
+        "hint": "使用下方 Cookie 作为独立备用账号，无需扫码。API 账号无法获取完整歌曲时再尝试它；同时需要启用官方网页音源。修改后重载插件",
+        "type": "bool",
+        "default": false
+    },
+    "ncm_web_cookie": {
+        "description": "网易云网页 Cookie",
+        "hint": "从已登录的 music.163.com 网页请求中复制完整 Cookie，需包含 MUSIC_U。仅填 Cookie 内容；不要公开或发到群聊。与扫码账号独立保存",
+        "type": "string",
+        "default": ""
+    },
+    "meting_enabled": {
+        "description": "启用 Meting 镜像音源",
+        "hint": "API 账号与网页音源均不可用时尝试镜像。下载或音频探测失败后继续尝试已启用的官方外链",
+        "type": "bool",
+        "default": true
+    },
+    "ncm_outer_enabled": {
+        "description": "启用网易云官方外链音源",
+        "hint": "独立控制最后一级音频外链兜底。全部音源关闭或失败时仍返回歌曲网页链接",
+        "type": "bool",
+        "default": true
     },
     "meting_api": {
         "description": "Meting 镜像地址",
@@ -31,7 +85,7 @@
     },
     "quality": {
         "description": "期望音质档位",
-        "hint": "取不到所选档位时自动逐级回退；无损 FLAC 及以上需扫码登录会员账号。无损/母带文件较大（30-100MB），请同步调大「下载大小上限」",
+        "hint": "从所选档位向下逐级回退，显示实际返回音质。高音质取决于扫码账号或网页 Cookie 账号的歌曲权益；无损/母带文件较大（30-100MB），请同步调大下载大小上限",
         "type": "string",
         "options": [
             "标准 128k",
@@ -108,7 +162,7 @@
     },
     "download_max_mb": {
         "description": "下载大小上限（MB）",
-        "hint": "超过该大小的歌曲不下载，直接降级为音乐卡片/链接。无损/母带文件通常 30-100MB，想用高音质请调大",
+        "hint": "单个音源超过大小上限后尝试较低音质或下一个启用的音源；全部失败返回歌曲网页链接。无损/母带文件通常 30-100MB",
         "type": "int",
         "default": 40
     },

@@ -7,25 +7,23 @@
 """
 
 import glob
-import math
 import uuid
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
-
 from astrbot.api import logger
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from .ncm_api import Comment, Song
 
 # 配色：浅色磨砂系
-ACCENT = (225, 45, 60)          # 网易云红
+ACCENT = (225, 45, 60)  # 网易云红
 BG_TOP = (247, 249, 252)
 BG_BOTTOM = (232, 237, 244)
 CARD_WHITE = (255, 255, 255)
 BORDER = (222, 227, 235)
-INK = (26, 26, 31)              # 主文字
-GRAY = (122, 127, 138)          # 次要文字
+INK = (26, 26, 31)  # 主文字
+GRAY = (122, 127, 138)  # 次要文字
 LIGHT_GRAY = (165, 170, 180)
 
 _FONT_CANDIDATES = [
@@ -104,11 +102,15 @@ def _v_gradient(w: int, h: int, top, bottom) -> Image.Image:
     base = Image.new("RGB", (1, h))
     for y in range(h):
         t = y / max(1, h - 1)
-        base.putpixel((0, y), tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)))
+        base.putpixel(
+            (0, y), tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
+        )
     return base.resize((w, h))
 
 
-def _load_square(img_bytes: bytes | None, size: int, fallback=(226, 230, 238)) -> Image.Image:
+def _load_square(
+    img_bytes: bytes | None, size: int, fallback=(226, 230, 238)
+) -> Image.Image:
     if img_bytes:
         try:
             img = Image.open(BytesIO(img_bytes)).convert("RGB")
@@ -118,7 +120,9 @@ def _load_square(img_bytes: bytes | None, size: int, fallback=(226, 230, 238)) -
     return Image.new("RGB", (size, size), fallback)
 
 
-def _make_disc(cover_bytes: bytes | None, size: int, hole_ratio: float = 0.020) -> Image.Image:
+def _make_disc(
+    cover_bytes: bytes | None, size: int, hole_ratio: float = 0.020
+) -> Image.Image:
     """把封面渲染成一张 CD 光盘：圆形盘面 + 彩虹光泽 + 液态玻璃盘心 + 中心孔"""
     S = size
     base = _load_square(cover_bytes, S)
@@ -161,7 +165,9 @@ def _make_disc(cover_bytes: bytes | None, size: int, hole_ratio: float = 0.020) 
     hub = base.crop((m0, m0, m0 + mag, m0 + mag)).resize((hub_d, hub_d), Image.LANCZOS)
     hub = hub.filter(ImageFilter.GaussianBlur(max(2, S // 60))).convert("RGBA")
     # 玻璃提亮层（轻薄半透明白，保留封面透出的颜色）
-    hub = Image.alpha_composite(hub, Image.new("RGBA", (hub_d, hub_d), (255, 255, 255, 30)))
+    hub = Image.alpha_composite(
+        hub, Image.new("RGBA", (hub_d, hub_d), (255, 255, 255, 30))
+    )
     hub_mask = Image.new("L", (hub_d, hub_d), 0)
     ImageDraw.Draw(hub_mask).ellipse((0, 0, hub_d, hub_d), fill=255)
     # 顶部月牙形高光（边缘锐利、内侧柔化，模拟曲面反光）
@@ -171,7 +177,9 @@ def _make_disc(cover_bytes: bytes | None, size: int, hole_ratio: float = 0.020) 
         fill=(255, 255, 255, 130),
     )
     hl = hl.filter(ImageFilter.GaussianBlur(max(1, hub_d // 14)))
-    hl.putalpha(Image.composite(hl.split()[3], Image.new("L", (hub_d, hub_d), 0), hub_mask))
+    hl.putalpha(
+        Image.composite(hl.split()[3], Image.new("L", (hub_d, hub_d), 0), hub_mask)
+    )
     hub = Image.alpha_composite(hub, hl)
     # 底部暗色月牙，增加液体厚度感
     dk = Image.new("RGBA", (hub_d, hub_d), (0, 0, 0, 0))
@@ -180,29 +188,47 @@ def _make_disc(cover_bytes: bytes | None, size: int, hole_ratio: float = 0.020) 
         fill=(20, 24, 32, 42),
     )
     dk = dk.filter(ImageFilter.GaussianBlur(max(1, hub_d // 10)))
-    dk.putalpha(Image.composite(dk.split()[3], Image.new("L", (hub_d, hub_d), 0), hub_mask))
+    dk.putalpha(
+        Image.composite(dk.split()[3], Image.new("L", (hub_d, hub_d), 0), hub_mask)
+    )
     hub = Image.alpha_composite(hub, dk)
     disc.paste(hub, (c0, c0), hub_mask)
     # 玻璃边缘：整圈内阴影 + 上半圈亮边折射
     rim_w = max(2, hub_d // 16)
     draw.ellipse(
         (cx - hub_r, cx - hub_r, cx + hub_r, cx + hub_r),
-        outline=(0, 0, 0, 60), width=rim_w,
+        outline=(0, 0, 0, 60),
+        width=rim_w,
     )
     draw.arc(
         (cx - hub_r + 1, cx - hub_r + 1, cx + hub_r - 1, cx + hub_r - 1),
-        start=180, end=360, fill=(255, 255, 255, 150), width=rim_w,
+        start=180,
+        end=360,
+        fill=(255, 255, 255, 150),
+        width=rim_w,
     )
     # 毂环高光线
     for rr, alpha in ((hub_r, 130), (hub_r * 0.72, 70)):
-        draw.ellipse((cx - rr, cx - rr, cx + rr, cx + rr), outline=(255, 255, 255, alpha), width=2)
+        draw.ellipse(
+            (cx - rr, cx - rr, cx + rr, cx + rr),
+            outline=(255, 255, 255, alpha),
+            width=2,
+        )
     # 银色内圈
     sil_r = S * 0.042
-    draw.ellipse((cx - sil_r, cx - sil_r, cx + sil_r, cx + sil_r), fill=(208, 212, 218, 255))
-    draw.ellipse((cx - sil_r, cx - sil_r, cx + sil_r, cx + sil_r), outline=(160, 166, 175, 255), width=2)
+    draw.ellipse(
+        (cx - sil_r, cx - sil_r, cx + sil_r, cx + sil_r), fill=(208, 212, 218, 255)
+    )
+    draw.ellipse(
+        (cx - sil_r, cx - sil_r, cx + sil_r, cx + sil_r),
+        outline=(160, 166, 175, 255),
+        width=2,
+    )
     # 中心孔
     hole_r = S * hole_ratio
-    draw.ellipse((cx - hole_r, cx - hole_r, cx + hole_r, cx + hole_r), fill=(30, 30, 36, 255))
+    draw.ellipse(
+        (cx - hole_r, cx - hole_r, cx + hole_r, cx + hole_r), fill=(30, 30, 36, 255)
+    )
 
     # 圆形蒙版
     mask = Image.new("L", (S, S), 0)
@@ -212,7 +238,13 @@ def _make_disc(cover_bytes: bytes | None, size: int, hole_ratio: float = 0.020) 
     return out
 
 
-def _paste_shadow(base: Image.Image, fg: Image.Image, pos: tuple[int, int], blur: int = 18, alpha: int = 60):
+def _paste_shadow(
+    base: Image.Image,
+    fg: Image.Image,
+    pos: tuple[int, int],
+    blur: int = 18,
+    alpha: int = 60,
+):
     """给圆形元素加柔和投影"""
     x, y = pos
     sh = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -271,7 +303,9 @@ class CardRenderer:
         draw.text(
             (pad + 22, 51),
             _ellipsize(draw, f"网易云点歌 · {keyword}", f_title, W - pad * 2 - 40),
-            font=f_title, fill=INK, anchor="lm",
+            font=f_title,
+            fill=INK,
+            anchor="lm",
         )
         draw.line((pad, header_h - 8, W - pad, header_h - 8), fill=BORDER, width=2)
 
@@ -279,8 +313,11 @@ class CardRenderer:
             y = header_h + i * row_h
             # 白色行卡片
             draw.rounded_rectangle(
-                (pad, y + 9, W - pad, y + row_h - 9), 18,
-                fill=CARD_WHITE, outline=BORDER, width=1,
+                (pad, y + 9, W - pad, y + row_h - 9),
+                18,
+                fill=CARD_WHITE,
+                outline=BORDER,
+                width=1,
             )
             # 小 CD
             thumb = _make_disc(covers[i] if i < len(covers) else None, 92)
@@ -288,29 +325,39 @@ class CardRenderer:
             # 序号圆
             cx, cy, r = pad + 12 + 92 + 34, y + row_h // 2, 17
             draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=ACCENT)
-            draw.text((cx, cy - 1), str(i + 1), font=f_idx, fill=(255, 255, 255), anchor="mm")
+            draw.text(
+                (cx, cy - 1), str(i + 1), font=f_idx, fill=(255, 255, 255), anchor="mm"
+            )
             # 文本
             tx = cx + r + 16
             max_tw = W - tx - pad - 78
             draw.text(
                 (tx, y + 34),
                 _ellipsize(draw, song.name, f_name, max_tw),
-                font=f_name, fill=INK,
+                font=f_name,
+                fill=INK,
             )
             sub = f"{song.artists} · {song.album}" if song.album else song.artists
             draw.text(
                 (tx, y + 72),
                 _ellipsize(draw, sub, f_sub, max_tw),
-                font=f_sub, fill=GRAY,
+                font=f_sub,
+                fill=GRAY,
             )
             draw.text(
                 (W - pad - 18, y + row_h // 2),
-                song.duration_str, font=f_dur, fill=LIGHT_GRAY, anchor="rm",
+                song.duration_str,
+                font=f_dur,
+                fill=LIGHT_GRAY,
+                anchor="rm",
             )
 
         draw.text(
             (W // 2, H - footer_h // 2 - 2),
-            "回复序号点歌，例如：1", font=f_sub, fill=LIGHT_GRAY, anchor="mm",
+            "回复序号点歌，例如：1",
+            font=f_sub,
+            fill=LIGHT_GRAY,
+            anchor="mm",
         )
 
         path = self._save(bg, "selection")
@@ -345,31 +392,37 @@ class CardRenderer:
         draw.text(
             (tx + 24, pad + 42),
             _ellipsize(draw, song.name, f_title, max_tw - 24),
-            font=f_title, fill=INK, anchor="lm",
+            font=f_title,
+            fill=INK,
+            anchor="lm",
         )
         draw.text(
             (tx, pad + 116),
             _ellipsize(draw, song.artists, f_sub, max_tw),
-            font=f_sub, fill=GRAY,
+            font=f_sub,
+            fill=GRAY,
         )
         meta = " · ".join(x for x in [song.album, song.duration_str] if x)
         draw.text(
             (tx, pad + 164),
             _ellipsize(draw, meta, f_meta, max_tw),
-            font=f_meta, fill=LIGHT_GRAY,
+            font=f_meta,
+            fill=LIGHT_GRAY,
         )
         # 音质 / VIP 胶囊
         if vip == "ok":
-            tag, tag_color = f"VIP · {quality}", ACCENT          # VIP 账号下载：红框
+            tag, tag_color = f"VIP · {quality}", ACCENT  # VIP 账号下载：红框
         elif vip == "mirror":
-            tag, tag_color = f"VIP · {quality}", LIGHT_GRAY      # 非 VIP/镜像：灰框
+            tag, tag_color = f"VIP · {quality}", LIGHT_GRAY  # 非 VIP/镜像：灰框
         else:
-            tag, tag_color = f"♪ {quality}", ACCENT              # 普通歌曲：红色音质框
+            tag, tag_color = f"♪ {quality}", ACCENT  # 普通歌曲：红色音质框
         tag = _ellipsize(draw, tag, f_tag, max_tw)
         tw = draw.textlength(tag, font=f_tag)
         draw.rounded_rectangle(
-            (tx, pad + 214, tx + tw + 34, pad + 214 + 40), 20,
-            outline=tag_color, width=2,
+            (tx, pad + 214, tx + tw + 34, pad + 214 + 40),
+            20,
+            outline=tag_color,
+            width=2,
         )
         draw.text(
             (tx + 17, pad + 214 + 20), tag, font=f_tag, fill=tag_color, anchor="lm"
@@ -377,8 +430,11 @@ class CardRenderer:
 
         # 品牌角标
         draw.text(
-            (W - pad, H - pad + 4), "NetEase Cloud Music",
-            font=f_brand, fill=LIGHT_GRAY, anchor="rs",
+            (W - pad, H - pad + 4),
+            "NetEase Cloud Music",
+            font=f_brand,
+            fill=LIGHT_GRAY,
+            anchor="rs",
         )
 
         path = self._save(bg, "playing")
@@ -386,9 +442,7 @@ class CardRenderer:
 
     # ---------- 热评卡片 ----------
 
-    def render_comment(
-        self, comment: Comment, song: Song, avatar: bytes | None
-    ) -> str:
+    def render_comment(self, comment: Comment, song: Song, avatar: bytes | None) -> str:
         W, pad = 780, 34
         f_body = _load_font(26)
         f_sub = _load_font(21)
@@ -405,8 +459,11 @@ class CardRenderer:
 
         # 白色卡体
         draw.rounded_rectangle(
-            (pad // 2, pad // 2, W - pad // 2, H - pad // 2), 22,
-            fill=CARD_WHITE, outline=BORDER, width=1,
+            (pad // 2, pad // 2, W - pad // 2, H - pad // 2),
+            22,
+            fill=CARD_WHITE,
+            outline=BORDER,
+            width=1,
         )
         # 引号（手绘双平行四边形，避免字体缺字形）
         qx, qy = pad + 6, pad + 6
@@ -440,16 +497,22 @@ class CardRenderer:
         draw.text(
             (pad + 6 + av_size + 14, y + 14),
             _ellipsize(draw, comment.nickname, f_sub, 320),
-            font=f_sub, fill=GRAY,
+            font=f_sub,
+            fill=GRAY,
         )
         draw.text(
             (pad + 6 + av_size + 14, y + 38),
-            f"来自《{song.name}》的网易云热评", font=f_brand, fill=LIGHT_GRAY,
+            f"来自《{song.name}》的网易云热评",
+            font=f_brand,
+            fill=LIGHT_GRAY,
         )
         if comment.liked_count:
             draw.text(
                 (W - pad - 6, y + av_size // 2),
-                f"♥ {comment.liked_count}", font=f_sub, fill=ACCENT, anchor="rm",
+                f"♥ {comment.liked_count}",
+                font=f_sub,
+                fill=ACCENT,
+                anchor="rm",
             )
 
         path = self._save(bg, "comment")

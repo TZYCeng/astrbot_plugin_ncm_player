@@ -1,25 +1,27 @@
 import asyncio
 import base64
+import contextlib
 import os
 import re
 import time
 import uuid
+from pathlib import Path
 
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Node, Nodes, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
+from .core.auth import cookie_keys, has_music_u, normalize_cookie
 from .core.ncm_api import (
     NetEaseAPI,
+    PlaybackTrace,
     PlayInfo,
     Song,
-    cookie_keys,
-    has_music_u,
     normalize_quality,
 )
-from .core.ncm_server import EmbeddedNcmServer
+from .core.ncm_server import RELEASE_TAG, EmbeddedNcmServer
 from .core.renderer import CardRenderer
 from .core.sender import SongSender
 
@@ -29,7 +31,18 @@ INVALID_NOTICE_INTERVAL = 600  # 登录失效提示最小间隔（秒），避�
 CAPTCHA_COOLDOWN = 60  # 每个管理员发送短信的最小间隔（秒）
 
 # 关键词监听触发词
-LISTEN_TRIGGERS = ["我要听", "我想听", "想听", "听歌", "点歌", "来一首", "来首", "放一首", "放首", "播放"]
+LISTEN_TRIGGERS = [
+    "我要听",
+    "我想听",
+    "想听",
+    "听歌",
+    "点歌",
+    "来一首",
+    "来首",
+    "放一首",
+    "放首",
+    "播放",
+]
 LISTEN_PATTERN = "(" + "|".join(LISTEN_TRIGGERS) + ")"
 
 
@@ -45,26 +58,35 @@ def _mask_name(s: str) -> str:
     "astrbot_plugin_ncm_player",
     "Kimi",
     "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码/短信验证码登录、内置 NeteaseCloudMusicApi 服务",
-    "1.4.10",
+    "1.5.0",
 )
 class NcmPlayerPlugin(Star):
-    def __init__(self, context: Context, config: dict):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        self.cfg = config or {}
+        self.cfg = config
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_ncm_player")
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cookie_file = self.data_dir / "ncm_cookie.txt"
-        cookie = (
-            self.cookie_file.read_text(encoding="utf-8").strip()
-            if self.cookie_file.exists()
-            else ""
-        )
+        try:
+            cookie = (
+                self.cookie_file.read_text(encoding="utf-8")
+                if self.cookie_file.exists()
+                else ""
+            )
+        except OSError:
+            cookie = ""
+            logger.warning("[ncm_player] 无法读取已保存的 Cookie，请检查数据目录权限")
         self.api = NetEaseAPI(
             proxy=self.cfg.get("http_proxy", ""),
-            ncm_api_base=self.cfg.get("ncm_api_base", ""),
+            ncm_api_base=self._external_base(),
             meting_api=self.cfg.get("meting_api", "https://api.qijieya.cn/meting/"),
             cookie=cookie,
+            web_cookie=self.cfg.get("ncm_web_cookie", ""),
+            web_cookie_enabled=self.cfg.get("ncm_web_cookie_enabled", False),
+            web_enabled=self.cfg.get("ncm_web_enabled", True),
+            meting_enabled=self.cfg.get("meting_enabled", True),
+            outer_enabled=self.cfg.get("ncm_outer_enabled", True),
         )
         self.renderer = CardRenderer(self.cache_dir)
         self.sender = SongSender(self.cfg)
@@ -78,15 +100,35 @@ class NcmPlayerPlugin(Star):
         self._captcha_controller: SessionController | None = None
         self._captcha_sent_at: dict[str, float] = {}
         self._active_qr_path = None
+        self._service_lock = asyncio.Lock()
+        self._maintenance_lock = asyncio.Lock()
+        self._last_playback = "尚未点歌"
+        self._active_downloads: set = set()
         # 内置 NeteaseCloudMusicApi 服务（默认关闭：不下载、不启动进程）
-        self.embedded: EmbeddedNcmServer | None = None
-        if self.cfg.get("ncm_api_embedded", False):
-            self.embedded = EmbeddedNcmServer(
-                self.data_dir,
-                port=int(self.cfg.get("ncm_api_embedded_port", 13000)),
-                proxy=self.cfg.get("http_proxy", ""),
-                mirror=self.cfg.get("ncm_api_embedded_mirror", ""),
-            )
+        self.embedded = EmbeddedNcmServer(
+            self.data_dir,
+            port=int(self.cfg.get("ncm_api_embedded_port", 13000)),
+            proxy=self.cfg.get("http_proxy", ""),
+            mirror=self.cfg.get("ncm_api_embedded_mirror", ""),
+            acceleration_enabled=self.cfg.get("ncm_api_github_acceleration", True),
+            accelerators=self.cfg.get("ncm_api_github_accelerators"),
+            log_output=self.cfg.get("ncm_api_log_output", False),
+        )
+
+    def _external_base(self) -> str:
+        return (
+            str(self.cfg.get("ncm_api_base", "")).strip()
+            if self.cfg.get("ncm_api_external_enabled", True)
+            else ""
+        )
+
+    def _update_sources(self, embedded_url: str = ""):
+        self.api.set_api_sources(
+            [
+                ("内置 API", embedded_url),
+                ("外部 API", self._external_base()),
+            ]
+        )
 
     async def initialize(self):
         """插件加载后钩子。
@@ -98,35 +140,32 @@ class NcmPlayerPlugin(Star):
 
     async def _init_background(self):
         """后台初始化：按需启动内置服务并校验登录状态"""
-        if self.embedded:
-            try:
-                base = await self.embedded.start()
-                # 内置服务就绪后优先生效（本机服务，音质可控、支持扫码登录）
-                self.api.ncm_api_base = base
-                logger.info(f"[ncm_player] 已切换到内置 NeteaseCloudMusicApi: {base}")
-            except Exception as e:
-                logger.error(
-                    f"[ncm_player] 内置 NeteaseCloudMusicApi 启动失败，"
-                    f"回退到既有音源链路: {e}"
-                )
-        if self.api.ncm_api_base and self.api.cookie:
-            async with self._login_lock:
-                if self.api.cookie:
-                    if await self.api.probe_login(force=True):
-                        logger.info(
-                            f"[ncm_player] 登录态有效，UID={self.api.account_uid}，"
-                            f"VIP字段判定={'是' if self.api.vip else '否'}"
-                        )
-                    else:
-                        logger.warning(
-                            "[ncm_player] 本地 Cookie 尚未通过复核；可检查服务后重新扫码"
-                        )
+        async with self._service_lock:
+            if self.cfg.get("ncm_api_embedded", False):
+                try:
+                    self._update_sources(await self.embedded.start())
+                except Exception as exc:
+                    logger.error(
+                        f"[ncm_player] 内置 API 启动失败，继续使用其他已启用音源: {exc}"
+                    )
+        await self._probe_accounts()
 
-    async def terminate(self):
+    async def _probe_accounts(self):
+        checks = [self.api.probe_login(force=True)]
+        if self.api.web_enabled and self.api.web_cookie_enabled:
+            checks.append(self.api.probe_login(force=True, credential="web"))
+        await asyncio.gather(*checks)
+
+    async def _cancel_background(self):
         task = getattr(self, "_bg_task", None)
         if task and not task.done():
             task.cancel()
-        if self.embedded:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def terminate(self):
+        await self._cancel_background()
+        async with self._service_lock:
             await self.embedded.stop()
         await self.api.close()
 
@@ -154,7 +193,9 @@ class NcmPlayerPlugin(Star):
         if item and item[1] is songs:
             self.pending.pop(origin, None)
 
-    async def _search_and_render(self, event: AstrMessageEvent, keyword: str) -> list[Song] | None:
+    async def _search_and_render(
+        self, event: AstrMessageEvent, keyword: str
+    ) -> list[Song] | None:
         """搜索并发送选歌图，返回候选列表（已缓存）"""
         limit = int(self.cfg.get("search_limit", 5))
         try:
@@ -191,6 +232,8 @@ class NcmPlayerPlugin(Star):
             )
             return None
         dest = self.cache_dir / f"{song.id}_{uuid.uuid4().hex[:8]}.{play.ext}"
+        self._active_downloads.add(dest)
+        completed = False
         try:
             await self.api.download(
                 play.url,
@@ -198,11 +241,22 @@ class NcmPlayerPlugin(Star):
                 max_mb=max_mb,
                 timeout=int(self.cfg.get("download_timeout", 20)),
             )
+            completed = True
             return str(dest)
         except Exception as e:
             logger.warning(f"[ncm_player] 下载失败: {e}")
-            dest.unlink(missing_ok=True)
             return None
+        finally:
+            # 取消也必须移除半成品；成功文件在发送/协议端读取期间继续受保护。
+            if not completed:
+                self._expire_audio(dest)
+
+    def _expire_audio(self, path: Path):
+        self._active_downloads.discard(path)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("[ncm_player] 音频缓存删除失败，可稍后使用清理缓存命令")
 
     async def _send_comment_card(self, event: AstrMessageEvent, song: Song):
         """嗅探一条热评，渲染成卡片发送"""
@@ -228,7 +282,11 @@ class NcmPlayerPlugin(Star):
                 uin = "0"
             title = f"《{song.name}》- {song.artists} 歌词"
             nodes = [
-                Node(uin=uin, name="网易云歌词", content=[Plain(f"🎵 {title}\n共 {len(lines)} 行")])
+                Node(
+                    uin=uin,
+                    name="网易云歌词",
+                    content=[Plain(f"🎵 {title}\n共 {len(lines)} 行")],
+                )
             ]
             for i in range(0, len(lines), LYRICS_PER_NODE):
                 chunk = lines[i : i + LYRICS_PER_NODE]
@@ -243,7 +301,10 @@ class NcmPlayerPlugin(Star):
         """登录失效/未登录时给点歌用户一个明确提示（10 分钟内最多一次，避免刷屏）"""
         if not self.api.ncm_api_base:
             return
-        if self.api.login_valid is not False:
+        if (
+            self.api.account.login_valid is not False
+            or self.api.web_account.login_valid is True
+        ):
             return
         now = time.time()
         if now - self._invalid_notice_ts < INVALID_NOTICE_INTERVAL:
@@ -252,9 +313,8 @@ class NcmPlayerPlugin(Star):
         try:
             await event.send(
                 event.plain_result(
-                    "⚠️ 网易云未登录或登录已失效，无损/会员音质不可用，"
-                    "VIP 歌曲已自动降级到 Meting 镜像（音质受限）。"
-                    "管理员可使用 /网易云登录 重新扫码解锁"
+                    "⚠️ 网易云 API 账号未登录或登录已失效，将按配置尝试备用音源。"
+                    "管理员可使用 /网易云登录，或配置网页 Cookie；详情见 /网易云诊断。"
                 )
             )
         except Exception as e:
@@ -262,40 +322,57 @@ class NcmPlayerPlugin(Star):
 
     async def _play(self, event: AstrMessageEvent, song: Song) -> str:
         """取播放地址 → 下载（如需）→ 播放卡片 → 发送 → 热评/歌词。返回结果描述"""
-        # 点歌时若已知登录失效，先给提示
-        await self._notify_login_invalid(event)
         quality = normalize_quality(self.cfg.get("quality", "exhigh"))
-        play = await self.api.get_play_info(song.id, quality)
-        if not play or not play.url:
-            return f"未能获取《{song.name}》的播放地址（可能为 VIP/无版权歌曲）"
-        # 本次取地址若新检测到试听片段（登录失效/非会员），登录态已刷新，再提示一次
-        if self.api.last_fallback == "trial":
+        load_mode = str(self.cfg.get("load_mode", "file"))
+        trace = PlaybackTrace()
+        play = None
+        audio_path = None
+        async for candidate in self.api.iter_play_info(song.id, quality, trace):
+            if load_mode in ("file", "base64"):
+                audio_path = await self._download(song, candidate)
+                available = audio_path is not None
+            else:
+                # URL 模式仍探测响应，坏镜像链接不能阻止后面的外链兜底。
+                available = await self.api.check_audio_url(candidate.url)
+            if available:
+                play = candidate
+                break
+            trace.record(candidate.source_label, "下载或音频探测失败")
+        if not play:
+            self._last_playback = (
+                f"歌曲 {song.id} 失败：{trace.summary or '所有音源均已关闭'}"
+            )
+            message = f"未能获取《{song.name}》的完整音频，已尝试所有启用的音源。"
+            await event.send(event.plain_result(f"{message}\n{song.page_url}"))
+            return message
+        play.fallback_reason = trace.summary
+        try:
             await self._notify_login_invalid(event)
 
-        load_mode = str(self.cfg.get("load_mode", "file"))
-        audio_path = None
-        if load_mode in ("file", "base64"):
-            audio_path = await self._download(song, play)
-
-        # 播放卡片图（CD + 歌名；VIP 歌曲按下载来源标红/灰 VIP 框）
-        if self.cfg.get("send_play_card", True):
-            try:
-                vip_mark = ""
-                if play.is_vip_song or self.api.last_fallback == "trial":
-                    vip_mark = (
-                        "ok"
-                        if play.source == "ncm" and self.api.vip
-                        else "mirror"
+            # 播放卡片图（CD + 歌名；VIP 歌曲按下载来源标红/灰 VIP 框）
+            if self.cfg.get("send_play_card", True):
+                try:
+                    vip_mark = ""
+                    if play.is_vip_song or trace.trial:
+                        vip_mark = (
+                            "ok"
+                            if play.source in ("ncm", "web") and play.authenticated
+                            else "mirror"
+                        )
+                    cover = await self.api.fetch_bytes(song.pic_url)
+                    card = self.renderer.render_playing(
+                        song, cover, play.quality_str, vip_mark
                     )
-                cover = await self.api.fetch_bytes(song.pic_url)
-                card = self.renderer.render_playing(
-                    song, cover, play.quality_str, vip_mark
+                    await event.send(event.chain_result([Image.fromFileSystem(card)]))
+                except Exception as e:
+                    logger.warning(f"[ncm_player] 播放卡片发送失败: {e}")
+            method = await self.sender.send(event, song, play, audio_path)
+        finally:
+            # 发送失败或取消仍安排清理，给协议端保留读取本地文件的时间。
+            if audio_path:
+                asyncio.get_running_loop().call_later(
+                    120, self._expire_audio, Path(audio_path)
                 )
-                await event.send(event.chain_result([Image.fromFileSystem(card)]))
-            except Exception as e:
-                logger.warning(f"[ncm_player] 播放卡片发送失败: {e}")
-
-        method = await self.sender.send(event, song, play, audio_path)
 
         # 热评卡片 + 歌词合并转发（独立于歌曲发送，失败互不影响）
         if self.cfg.get("send_comment_card", True):
@@ -303,19 +380,11 @@ class NcmPlayerPlugin(Star):
         if self.cfg.get("send_lyrics_forward", True):
             await self._send_lyrics_forward(event, song)
 
-        # 清理本次下载的缓存文件（延迟删除，等协议端读取完毕）
-        if audio_path:
-            try:
-                from pathlib import Path as _P
-
-                asyncio.get_running_loop().call_later(
-                    120, lambda p=audio_path: _P(p).unlink(missing_ok=True)
-                )
-            except Exception:
-                pass
         result = f"《{song.name}》- {song.artists}，音质 {play.quality_str}，以「{method}」方式发送"
-        if self.api.last_fallback == "trial":
-            result += "（VIP/登录失效，已自动降级 Meting 镜像）"
+        result += f"，来源 {play.source_label}"
+        if play.fallback_reason:
+            result += f"（回退：{play.fallback_reason}）"
+        self._last_playback = f"歌曲 {song.id}：{result}"
         return result
 
     # ---------- LLM 工具 ----------
@@ -392,7 +461,7 @@ class NcmPlayerPlugin(Star):
         m = re.search(LISTEN_PATTERN, text)
         if not m or m.start() > 6:
             return  # 触发词位置太靠后，多半是闲聊而非点歌
-        rest = text[m.end():]
+        rest = text[m.end() :]
         if rest[:1] == m.group(1)[-1:]:
             return  # 「想听听…」叠词，非点歌
         book = re.search(r"《(.+?)》", rest)
@@ -412,7 +481,10 @@ class NcmPlayerPlugin(Star):
     async def pick_by_number(self, event: AstrMessageEvent):
         """选歌列表待选期间，纯数字消息视为点歌序号"""
         origin = self._pend_key(event)
-        if origin in self._waiting and self._get_pending(event) is self._waiting[origin]:
+        if (
+            origin in self._waiting
+            and self._get_pending(event) is self._waiting[origin]
+        ):
             return
         songs = self._get_pending(event)
         if not songs:
@@ -454,7 +526,11 @@ class NcmPlayerPlugin(Star):
             if not same_user:
                 return  # 同一群聊中其他人的消息：不处理也不结束等待
             text = ev.message_str.strip()
-            if self._get_pending(ev) is not songs and text not in ("取消", "算了", "不用了"):
+            if self._get_pending(ev) is not songs and text not in (
+                "取消",
+                "算了",
+                "不用了",
+            ):
                 controller.stop()
                 return
             if text in ("取消", "算了", "不用了"):
@@ -474,7 +550,7 @@ class NcmPlayerPlugin(Star):
 
         try:
             await pick_waiter(event)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             await event.send(event.plain_result("点歌等待超时，已取消"))
         except Exception as e:
             logger.error(f"[ncm_player] 选歌会话异常: {e}")
@@ -511,7 +587,12 @@ class NcmPlayerPlugin(Star):
         removed, failed = 0, []
         try:
             for path in self.cache_dir.iterdir():
-                if path == self._active_qr_path or path.is_symlink() or not path.is_file():
+                if (
+                    path == self._active_qr_path
+                    or path in self._active_downloads
+                    or path.is_symlink()
+                    or not path.is_file()
+                ):
                     continue
                 try:
                     path.unlink()
@@ -524,6 +605,128 @@ class NcmPlayerPlugin(Star):
         if failed:
             text += " 删除失败：" + "；".join(failed)
         yield event.plain_result(text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("网易云删除API")
+    async def cmd_delete_api(self, event: AstrMessageEvent):
+        """持久化关闭内置服务，回收进程后删除插件托管的程序和运行缓存。"""
+        yield event.plain_result("正在关闭并删除内置 API…")
+        yield event.plain_result(await self._manage_api(reinstall=False))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("网易云重装API")
+    async def cmd_reinstall_api(self, event: AstrMessageEvent):
+        """重新下载固定版本并重置隔离运行目录，同时持久化开启内置服务。"""
+        yield event.plain_result("正在重新部署内置 API，首次下载可能需要几分钟…")
+        yield event.plain_result(await self._manage_api(reinstall=True))
+
+    def _persist_embedded(self, enabled: bool):
+        # 必须持有原始 AstrBotConfig 对象；普通 dict 无法持久化插件配置。
+        save = getattr(self.cfg, "save_config", None)
+        if not callable(save):
+            raise RuntimeError("当前配置对象不支持持久化，请从 AstrBot 插件配置页操作")
+        existed = "ncm_api_embedded" in self.cfg
+        previous = self.cfg.get("ncm_api_embedded")
+        self.cfg["ncm_api_embedded"] = enabled
+        try:
+            save()
+        except Exception:
+            if existed:
+                self.cfg["ncm_api_embedded"] = previous
+            else:
+                self.cfg.pop("ncm_api_embedded", None)
+            raise
+
+    async def _manage_api(self, reinstall: bool) -> str:
+        if self._maintenance_lock.locked():
+            return "已有内置 API 管理操作进行中，请等待结束"
+        async with self._maintenance_lock:
+            try:
+                self._persist_embedded(reinstall)
+            except Exception as exc:
+                logger.error(f"[ncm_player] 内置服务开关保存失败: {type(exc).__name__}")
+                return "无法保存内置服务开关，操作已取消，请检查配置文件权限"
+            await self._cancel_background()
+            async with self._service_lock:
+                async with self._login_lock:
+                    self._login_generation += 1
+                    if self._captcha_controller:
+                        self._captcha_controller.stop()
+                self._update_sources()
+                try:
+                    if reinstall:
+                        base = await self.embedded.reinstall()
+                        self._update_sources(base)
+                    else:
+                        await self.embedded.remove()
+                except Exception as exc:
+                    logger.error(
+                        f"[ncm_player] 内置 API 管理失败: {type(exc).__name__}"
+                    )
+                    return (
+                        "内置 API 操作失败；其他已启用音源仍可使用。"
+                        "使用 /网易云诊断 查看状态并检查数据目录权限、端口或下载源。"
+                    )
+            await self._probe_accounts()
+            if reinstall:
+                return f"内置 API {self.embedded.version} 已重新下载、校验并启动；开关已开启，账号已重新复核。"
+            return "内置 API 程序及运行缓存已删除，开关已保存为关闭；下次在配置页开启并重载插件时会重新下载。"
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("网易云诊断")
+    async def cmd_diagnose(self, event: AstrMessageEvent):
+        """只展示账号身份与来源，不回显 Cookie、二维码令牌或手机号。"""
+        yield event.plain_result("正在复核账号和 API 状态…")
+        await self._probe_accounts()
+        lines = [
+            "网易云诊断",
+            f"内置 API：{'开启' if self.cfg.get('ncm_api_embedded') else '关闭'} / {self.embedded.state}",
+            f"内置目标版本：{RELEASE_TAG}",
+        ]
+        if self.embedded.last_error:
+            lines.append(f"最近启动错误：{self.embedded.last_error}")
+        for service, base in tuple(self.api.api_sources):
+            try:
+                payload = await self.api._api_request(
+                    "/inner/version", base=base, cookie=""
+                )
+                version = (payload.get("data") or {}).get("version", "版本未知")
+                lines.append(f"{service}：可达 / {version}")
+            except Exception as exc:
+                lines.append(f"{service}：检查失败({type(exc).__name__})")
+        if not self.api.api_sources:
+            lines.append("当前没有启用且可用的 API 服务")
+        for label, account in (
+            ("API 登录账号", self.api.account),
+            ("网页 Cookie 账号", self.api.web_account),
+        ):
+            if label.startswith("网页") and not (
+                self.api.web_enabled and self.api.web_cookie_enabled
+            ):
+                lines.append(f"{label}：已关闭")
+                continue
+            status = (
+                "已登录"
+                if account.login_valid
+                else ("未通过" if account.login_valid is False else "未知")
+            )
+            lines.extend(
+                [
+                    f"{label}：{status} / {account.membership}",
+                    f"UID：{account.uid or '无'}；昵称：{account.nickname or '无'}；用户名：{_mask_name(account.user_name) if account.user_name else '无'}",
+                    f"核验来源：{account.service or '无'}；结果：{account.error or account.reason or '正常'}",
+                ]
+            )
+        lines.append(
+            f"音源开关：官方网页={'开' if self.api.web_enabled else '关'}，镜像={'开' if self.api.meting_enabled else '关'}，官方外链={'开' if self.api.outer_enabled else '关'}"
+        )
+        lines.append(f"最近点歌：{self._last_playback}")
+        if self.embedded.state == "启动失败" and self.embedded.recent_logs:
+            lines.append(
+                "最近 API 输出（脱敏）：\n"
+                + "\n".join(list(self.embedded.recent_logs)[-5:])
+            )
+        yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("网易云退出登录")
@@ -544,14 +747,18 @@ class NcmPlayerPlugin(Star):
         if error:
             yield event.plain_result(f"退出失败：本地 Cookie 文件无法删除：{error}")
         else:
-            yield event.plain_result("已清除本插件的本地 Cookie 和内存登录态；不影响缓存/服务，也不会撤销网易云 App 的设备授权。")
+            yield event.plain_result(
+                "已清除扫码/验证码登录的本地 Cookie 和内存登录态。手动网页 Cookie 可在配置页关闭或清空。"
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("网易云登录")
     async def cmd_login(self, event: AstrMessageEvent):
         """扫码后先用新 Cookie 独立复核，再持久化登录态。"""
         if not self.api.ncm_api_base:
-            yield event.plain_result("请先开启内置服务或配置 ncm_api_base，再使用本命令")
+            yield event.plain_result(
+                "请先开启内置服务或配置 ncm_api_base，再使用本命令"
+            )
             return
         async with self._login_lock:
             active = self._login_active
@@ -573,11 +780,15 @@ class NcmPlayerPlugin(Star):
     async def cmd_captcha_login(self, event: AstrMessageEvent):
         """仅在管理员私聊会话中获取手机号和短信验证码。"""
         if not event.is_private_chat() or not event.is_admin():
-            yield event.plain_result("仅支持管理员私聊操作；不要在群聊发送手机号或验证码")
+            yield event.plain_result(
+                "仅支持管理员私聊操作；不要在群聊发送手机号或验证码"
+            )
             return
         command_text = (event.message_str or "").strip()
         if command_text not in ("网易云验证码登录", "/网易云验证码登录"):
-            yield event.plain_result("命令不能附带手机号或验证码；请仅发送 /网易云验证码登录")
+            yield event.plain_result(
+                "命令不能附带手机号或验证码；请仅发送 /网易云验证码登录"
+            )
             return
         if not self.api.ncm_api_base:
             yield event.plain_result("请先开启内置服务或配置 ncm_api_base")
@@ -598,23 +809,30 @@ class NcmPlayerPlugin(Star):
         yield event.plain_result(result)
 
     async def _captcha_flow(self, event: AstrMessageEvent, generation: int) -> str:
+        base = self.api.ncm_api_base  # 一次登录固定使用同一服务，后台启动不改变会话。
         sender = event.get_sender_id()
         origin = event.unified_msg_origin
         stage = "phone"
         phone = ""
         attempts = 0
         result = "验证码等待超时；原登录态未更改"
-        await event.send(event.plain_result(
-            "请在此管理员私聊发送绑定网易云账号的中国大陆手机号（默认国家码 86）。"
-            "聊天平台可能留存私聊内容，请仅在可信环境使用；发送「取消」结束。"
-        ))
+        await event.send(
+            event.plain_result(
+                "请在此管理员私聊发送绑定网易云账号的中国大陆手机号（默认国家码 86）。"
+                "聊天平台可能留存私聊内容，请仅在可信环境使用；发送「取消」结束。"
+            )
+        )
 
         @session_waiter(timeout=180)
         async def captcha_waiter(controller: SessionController, ev: AstrMessageEvent):
             nonlocal stage, phone, attempts, result
             self._captcha_controller = controller
-            if (ev.unified_msg_origin != origin or ev.get_sender_id() != sender
-                    or not ev.is_private_chat() or not ev.is_admin()):
+            if (
+                ev.unified_msg_origin != origin
+                or ev.get_sender_id() != sender
+                or not ev.is_private_chat()
+                or not ev.is_admin()
+            ):
                 return
             if generation != self._login_generation:
                 result = "登录已被退出登录操作取消；原登录态未更改"
@@ -628,7 +846,11 @@ class NcmPlayerPlugin(Star):
                 return
             if stage == "phone":
                 if not re.fullmatch(r"1[3-9][0-9]{9}", text):
-                    await ev.send(ev.plain_result("手机号格式无效；请发送 11 位中国大陆手机号或「取消」"))
+                    await ev.send(
+                        ev.plain_result(
+                            "手机号格式无效；请发送 11 位中国大陆手机号或「取消」"
+                        )
+                    )
                     return
                 now = time.monotonic()
                 async with self._login_lock:
@@ -636,16 +858,21 @@ class NcmPlayerPlugin(Star):
                         result = "登录已取消；原登录态未更改"
                         controller.stop()
                         return
-                    if now - self._captcha_sent_at.get(sender, -CAPTCHA_COOLDOWN) < CAPTCHA_COOLDOWN:
+                    if (
+                        now - self._captcha_sent_at.get(sender, -CAPTCHA_COOLDOWN)
+                        < CAPTCHA_COOLDOWN
+                    ):
                         result = "短信发送过于频繁；请稍后再试，原登录态未更改"
                         controller.stop()
                         return
                     self._captcha_sent_at[sender] = now
                 phone = text
                 try:
-                    await self.api.send_captcha(phone)
+                    await self.api.send_captcha(phone, base=base)
                 except Exception:
-                    result = "短信发送失败或受到风控；请稍后在官方客户端确认，原登录态未更改"
+                    result = (
+                        "短信发送失败或受到风控；请稍后在官方客户端确认，原登录态未更改"
+                    )
                     controller.stop()
                     return
                 if generation != self._login_generation:
@@ -653,20 +880,32 @@ class NcmPlayerPlugin(Star):
                     controller.stop()
                     return
                 stage = "captcha"
-                await ev.send(ev.plain_result("短信请求已提交；请在此私聊发送验证码（3 分钟内），或发送「取消」。请勿转发验证码。"))
+                await ev.send(
+                    ev.plain_result(
+                        "短信请求已提交；请在此私聊发送验证码（3 分钟内），或发送「取消」。请勿转发验证码。"
+                    )
+                )
                 return
             if not re.fullmatch(r"[0-9]{4,8}", text):
-                await ev.send(ev.plain_result("验证码格式无效；请发送 4-8 位数字或「取消」"))
+                await ev.send(
+                    ev.plain_result("验证码格式无效；请发送 4-8 位数字或「取消」")
+                )
                 return
             attempts += 1
             try:
-                cookie = await self.api.login_cellphone(phone, text)
+                cookie = await self.api.login_cellphone(phone, text, base=base)
             except Exception:
                 if attempts >= 2:
-                    result = "验证码登录未成功；已达到重试上限，请停止重试并检查是否受到风控"
+                    result = (
+                        "验证码登录未成功；已达到重试上限，请停止重试并检查是否受到风控"
+                    )
                     controller.stop()
                 else:
-                    await ev.send(ev.plain_result("验证码登录未成功；最多再试一次，若受到风控请停止重试"))
+                    await ev.send(
+                        ev.plain_result(
+                            "验证码登录未成功；最多再试一次，若受到风控请停止重试"
+                        )
+                    )
                 return
             if generation != self._login_generation:
                 result = "登录已取消；原登录态未更改"
@@ -674,7 +913,8 @@ class NcmPlayerPlugin(Star):
                 return
             candidate = NetEaseAPI(
                 proxy=self.cfg.get("http_proxy", ""),
-                ncm_api_base=self.api.ncm_api_base, cookie=cookie,
+                ncm_api_base=base,
+                cookie=cookie,
             )
             try:
                 result = await self._save_login(cookie, candidate, generation, "验证码")
@@ -684,7 +924,7 @@ class NcmPlayerPlugin(Star):
 
         try:
             await captcha_waiter(event)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             result = "验证码等待超时；原登录态未更改"
         except Exception:
             result = "验证码登录失败；原登录态未更改"
@@ -695,16 +935,19 @@ class NcmPlayerPlugin(Star):
             return "登录已被退出登录操作取消；原登录态未更改"
         return result
 
-    async def _save_login(self, cookie: str, candidate: NetEaseAPI,
-                          generation: int, method: str) -> str:
+    async def _save_login(
+        self, cookie: str, candidate: NetEaseAPI, generation: int, method: str
+    ) -> str:
+        cookie = normalize_cookie(cookie)
         if not has_music_u(cookie):
             return "新 Cookie 缺少 MUSIC_U 登录凭证（疑似游客态）；原登录态未更改，请重新扫码"
         try:
             valid = await candidate.probe_login(force=True)
         except Exception:
             valid = False
-        if not valid or not candidate.account_uid:
-            reason = candidate.last_invalid_reason
+        account = candidate.account
+        if not valid or not account.uid:
+            reason = account.reason
             if reason == "guest":
                 return (
                     "新 Cookie 复核为游客/匿名会话（非账号登录），原登录态未更改；"
@@ -733,30 +976,21 @@ class NcmPlayerPlugin(Star):
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     logger.warning("[ncm_player] 临时 Cookie 文件清理失败")
-            self.api.set_cookie(cookie)
-            self.api.login_valid = True
-            self.api.last_invalid_reason = ""
-            self.api.vip = candidate.vip
-            self.api.account_uid = candidate.account_uid
-            self.api.account_nickname = candidate.account_nickname
-            self.api.account_user_name = candidate.account_user_name
-            self.api.account_anomaly = candidate.account_anomaly
-            self.api.login_detail_code = candidate.login_detail_code
-            self.api._login_check_ts = time.time()
+            self.api.adopt_login(candidate)
             self._invalid_notice_ts = 0.0
         # 昵称是公开信息，不打码展示，方便对照 App 确认是否登对账号；
         # userName 可能是手机号，仍打码。
-        if candidate.account_nickname:
-            name = f"，昵称：{candidate.account_nickname.strip()}"
-        elif candidate.account_user_name:
-            name = f"，用户名：{_mask_name(candidate.account_user_name)}"
+        if account.nickname:
+            name = f"，昵称：{account.nickname.strip()}"
+        elif account.user_name:
+            name = f"，用户名：{_mask_name(account.user_name)}"
         else:
             name = ""
-        status = "VIP 字段已确认" if candidate.vip else "未从接口确认 VIP 身份"
-        detail = (f"；user/detail 返回 {candidate.login_detail_code}，不能据此断定登错账号"
-                  if candidate.account_anomaly else "")
-        return (f"{method}登录并复核成功：UID {candidate.account_uid}{name}；{status}{detail}。"
-                "请对照网易云 App 中的 UID；若会员权益不符，排查服务、代理及接口缓存。")
+        detail = f"；{account.error}" if account.error else ""
+        return (
+            f"{method}登录并复核成功：UID {account.uid}{name}；{account.membership}{detail}。"
+            "请对照网易云 App 中的 UID；若会员权益不符，排查服务、代理及接口缓存。"
+        )
 
     def _expire_qr(self, path):
         if self._active_qr_path == path:
@@ -767,9 +1001,10 @@ class NcmPlayerPlugin(Star):
             logger.warning("[ncm_player] 二维码临时文件清理失败")
 
     async def _login_flow(self, event: AstrMessageEvent, generation: int) -> str:
+        base = self.api.ncm_api_base
         try:
-            key = await self.api.qr_key()
-            qrimg = await self.api.qr_create(key)
+            key = await self.api.qr_key(base=base)
+            qrimg = await self.api.qr_create(key, base=base)
             qr_path = self.cache_dir / f"login_qr_{uuid.uuid4().hex}.png"
             qr_path.write_bytes(base64.b64decode(qrimg.split(",", 1)[1]))
             prev_qr, self._active_qr_path = self._active_qr_path, qr_path
@@ -780,10 +1015,14 @@ class NcmPlayerPlugin(Star):
                 return "登录已被退出登录操作取消；请重新发起扫码"
             self._active_qr_path = qr_path
             try:
-                await event.send(event.chain_result([
-                    Image.fromFileSystem(str(qr_path)),
-                    Plain("请用网易云音乐 App 扫码登录（3 分钟内有效）"),
-                ]))
+                await event.send(
+                    event.chain_result(
+                        [
+                            Image.fromFileSystem(str(qr_path)),
+                            Plain("请用网易云音乐 App 扫码登录（3 分钟内有效）"),
+                        ]
+                    )
+                )
             finally:
                 asyncio.get_running_loop().call_later(240, self._expire_qr, qr_path)
         except Exception as e:
@@ -796,7 +1035,7 @@ class NcmPlayerPlugin(Star):
             if generation != self._login_generation:
                 return "登录已被退出登录操作取消；请重新发起扫码"
             try:
-                code, cookie = await self.api.qr_check(key)
+                code, cookie = await self.api.qr_check(key, base=base)
             except Exception as e:
                 logger.warning(f"[ncm_player] 扫码状态查询失败: {e}")
                 continue
@@ -806,7 +1045,9 @@ class NcmPlayerPlugin(Star):
                 return "二维码已过期，请重新发起登录"
             if code == 802 and not confirmed:
                 confirmed = True
-                await event.send(event.plain_result("扫码成功，请在网易云音乐 App 上点击确认登录"))
+                await event.send(
+                    event.plain_result("扫码成功，请在网易云音乐 App 上点击确认登录")
+                )
             if code != 803:
                 continue
             if not has_music_u(cookie):
@@ -822,7 +1063,7 @@ class NcmPlayerPlugin(Star):
                 )
             candidate = NetEaseAPI(
                 proxy=self.cfg.get("http_proxy", ""),
-                ncm_api_base=self.api.ncm_api_base,
+                ncm_api_base=base,
                 cookie=cookie,
             )
             try:

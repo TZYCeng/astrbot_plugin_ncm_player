@@ -1,115 +1,166 @@
 # 网易云点歌 · astrbot_plugin_ncm_player
 
-为 AstrBot 设计的网易云点歌插件，之前用的https://github.com/Zhalslar/astrbot_plugin_music 每次点歌都超时，语音都发不出来，于是按照这个插件的思路写了这个插件
-[![Version](https://img.shields.io/badge/version-v1.4.9-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_ncm_player)
-[![Python](https://img.shields.io/badge/python-3.8+-green.svg)](https://www.python.org/)
+为 AstrBot 设计的网易云点歌插件。设计思路参考 [Zhalslar/astrbot_plugin_music](https://github.com/Zhalslar/astrbot_plugin_music)，针对语音超时、音源回退和账号登录重新实现。
+
+[![Version](https://img.shields.io/badge/version-v1.5.0-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_ncm_player)
+[![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.9+-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
-[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-- **双通道点歌**：LLM 工具自然语言点歌 + 关键词监听兜底
-- **发送方式自定义**：语音优先自动降级、只发语音、只发文件、只发卡片、或语音+文件+卡片一起发
-- **音质档位化**：标准 128k / 较高 192k / 极高 320k / 无损 FLAC / 高清臻音 Hi-Res / 超清母带，自动逐级回退
-- **内置 NeteaseCloudMusicApi**：官方预编译服务已随插件打包（MIT 许可），一键开启即用，无需自己部署 Node 服务、无需联网下载
-- **扫码/验证码登录**：`/网易云登录` 扫码，或管理员私聊 `/网易云验证码登录` 输入绑定手机号和短信验证码，复核 UID 后解锁会员音质（无损 / Hi-Res / 母带）
-- **热评卡片**：点歌后嗅探一条最热评论，渲染成卡片随歌发送
-- **歌词合并转发**：嗅探整首歌词，以聊天记录（合并转发）形式发送，纯音乐自动跳过
-- **载入方式可选**：本地文件路径 / URL 直链 / base64 编码，适配不同部署拓扑
+- 自然语言 LLM 工具与关键词监听点歌，选歌按会话和用户隔离。
+- 语音、文件、音乐卡片及组合发送；支持本地路径、URL、base64 载入。
+- 扫码/短信登录与手动网页 Cookie 两路账号，分别核验 UID、昵称和会员状态。
+- 内置 API、外部 API、网页音源、Meting 镜像和官方外链独立开关、多层回退。
+- 标准至母带逐级降质，显示实际返回音质，识别试听；下载失败继续尝试其他来源。
+- CD 风选歌/播放卡片、热评卡片和歌词合并转发。
 
-## 安装
+## 安装与配置
 
-在 AstrBot WebUI → 插件 → 右下角 + → 上传本插件 zip 压缩包（或克隆本仓库到 `data/plugins/` 目录），重启后生效。
+在 AstrBot WebUI 安装本仓库，或将代码放入 `data/plugins/` 后重载插件。依赖为 `aiohttp`、`Pillow`，由 AstrBot 根据 `requirements.txt` 安装。
 
-依赖：`aiohttp`、`Pillow`（AstrBot 会自动安装 requirements.txt）。
+### 内置或外部 API
+
+- **内置**：开启 `ncm_api_embedded`，保存后重载插件。首次从 [api-enhanced Release](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/releases/tag/v4.40.1) 下载当前平台的二进制，校验大小及 SHA-256 后启动。仓库和插件包不携带二进制。
+- **外部**：开启 `ncm_api_external_enabled`，填写 `ncm_api_base`，例如 `http://127.0.0.1:3000`。
+- 两者可以单开、双开或全关；双开时内置优先，失败继续外部。全关仍可使用独立开启的网页、镜像和官方外链音源。
+- 内置服务支持 Linux/Windows/macOS x64；macOS arm64 需要 Rosetta，其他平台可使用外部 API。
+
+配置修改后重载插件生效。API 管理命令会立即执行并保存内置开关。
+
+### 网页 Cookie
+
+1. 在自己的浏览器登录 `music.163.com`。
+2. 在开发者工具的网络请求中复制请求头 `Cookie` 内容，应包含 `MUSIC_U`。
+3. 填入 `ncm_web_cookie`，打开 `ncm_web_cookie_enabled` 和 `ncm_web_enabled`，保存并重载。
+4. 管理员发送 `/网易云诊断` 核对网页账号的 UID、昵称及会员状态。
+
+网页 Cookie 不依赖先扫码，与扫码/短信账号分开保存。Cookie 是账号凭据，不要发到群聊或公开日志；过期后更新配置即可。会员状态查询失败显示“未知”，不会直接认定为非会员；歌曲是否可下载最终取决于实际返回的完整音频权限。
 
 ## 使用
 
-### 自然语言 / 关键词监听（推荐）
-
-```
-我：我要听晴天          ← LLM 工具调用；LLM 不灵时关键词监听自动接管
-AI：（发送 CD 风选歌图）
-我：2                  ← 纯数字序号直接播放（5 分钟内有效）
-AI：（发送播放卡片 + 语音 + 热评卡片 + 歌词合并转发）
+```text
+我：我要听晴天
+机器人：（选歌图）
+我：2
+机器人：（播放卡片、语音、热评和歌词）
 ```
 
-关键词监听支持「我想听 / 我要听 / 点歌 / 来一首 / 放一首 / 播放」等触发词，
-带防误触发机制（叠词「想听听…」、疑问句「想听什么」不会触发），可用 `enable_keyword_listen` 关闭。
-选歌状态按「群聊+用户」隔离，同一群聊多人同时选歌互不串台。
-
-纯数字序号快捷播放同样按用户隔离：选歌图发出后 5 分钟内，本人回复纯数字即可播放。
-
-### 指令
+关键词支持“我想听 / 我要听 / 点歌 / 来一首 / 放一首 / 播放”，可用 `enable_keyword_listen` 关闭。普通选歌结果 5 分钟内可回复数字；`/点歌` 的交互等待时间为 120 秒。
 
 | 指令 | 说明 |
 | --- | --- |
-| `/点歌 歌名` | 搜索并发送选歌图，120 秒内回复序号播放，发送「取消」退出 |
-| `/直接点歌 歌名` | 跳过选歌，直接播放第一首结果 |
-| `/网易云登录` | 管理员专用；生成二维码（需开启内置服务或配置外部服务），用新 Cookie 独立复核 UID 后保存 |
-| `/网易云验证码登录` | **仅管理员私聊**；不带参数，随后在私聊依次输入绑定账号的大陆手机号和短信验证码；3 分钟内有效，发送「取消」结束，短信至少间隔 60 秒，验证码最多尝试两次 |
-| `/网易云清理缓存` | 管理员专用；仅删除本插件数据目录 `cache/` 的普通临时文件并清空内存选歌候选，正在发送的扫码二维码暂时保留、稍后过期清理；不删 Cookie 或服务二进制，删除失败会报告 |
-| `/网易云退出登录` | 管理员专用；仅清本插件 Cookie 文件和内存登录态，保留缓存与服务，不撤销手机端设备授权 |
+| `/点歌 歌名` | 搜索选歌，回复序号或“取消” |
+| `/直接点歌 歌名` | 播放搜索到的第一首 |
+| `/网易云登录` | 管理员扫码登录，需要已就绪的内置或外部 API |
+| `/网易云验证码登录` | 仅管理员私聊，不带参数，按提示输入大陆手机号和验证码；短信间隔至少 60 秒，验证码最多尝试两次 |
+| `/网易云诊断` | 管理员核验两路账号 UID、昵称、打码用户名、会员状态、API 版本、启动错误及最近点歌回退原因 |
+| `/网易云退出登录` | 管理员清除扫码/验证码登录；手动网页 Cookie 在配置页关闭或清空 |
+| `/网易云清理缓存` | 管理员清理点歌临时文件和选歌状态，跳过正在下载/发送及等待协议端读取的音频与当前二维码 |
+| `/网易云删除API` | 管理员停止并删除内置 API 程序和隔离运行缓存，**持久化关闭内置开关**；下次开启并重载会重新下载 |
+| `/网易云重装API` | 管理员停止、删除、重新下载校验并启动内置 API，**持久化开启内置开关**，随后复核账号 |
 
-## 配置项
+删除/重装仅管理插件创建的服务，保留账号 Cookie、点歌缓存和外部 API。进行中的登录会取消，防止重装前的旧响应覆盖账号。重装失败可用诊断命令查看原因，其他启用的音源继续参与回退。
+
+## 音源与音质链路
+
+1. **API 登录账号**：内置 API → 外部 API，各服务从所选档位向下降质。
+2. **网页 Cookie 账号**：用独立 Cookie 尝试内置 API → 外部 API → 官方网页接口。
+3. **Meting 镜像**。
+4. **网易云官方外链**。
+
+仅尝试已启用的来源。未配置网页 Cookie 时，网页阶段仅尝试匿名网页接口。API 返回试听、无地址、请求失败，或实际音频下载失败/超限，都会继续链路；URL 模式先做少量音频响应探测。全部失败时发送歌曲网页链接。镜像、外链和账号均不保证拥有每首歌曲的版权或完整音频。
+
+API 账号与网页账号的会员信息独立，VIP 查询异常不覆盖已确认的账号身份。登录校验拒绝游客及 account/profile UID 不一致的响应。Cookie 经统一规范化后，以 POST Cookie 对象及规范请求头提交；带上游 `X-Apicache-Bypass` 与独立缓存键，避免 Cookie 格式或缓存造成错误身份。每次登录和点歌固定凭据快照，旧复核不能覆盖新登录。
+
+音质显示使用服务实际返回的 `level`、格式或码率，不将请求的母带档位直接标成下载结果。`freeTrialInfo` 的空值和字符串 `"null"` 不视为试听。
+
+## 主要配置
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `ncm_api_embedded` | `false` | 内置 NeteaseCloudMusicApi 服务开关。开启后优先使用插件包内预编译二进制并在本机运行，包内文件缺失时才从官方 Release 下载（MIT 许可），直接支持扫码登录与母带级音质；**默认关闭，不下载、不运行任何进程**，开启后需重载插件/重启生效 |
-| `ncm_api_embedded_port` | `13000` | 内置服务监听的本机端口（仅 127.0.0.1 可访问），端口冲突时再改 |
-| `ncm_api_embedded_mirror` | 空 | 内置服务下载镜像前缀（如 `https://ghfast.top/`），服务器访问 GitHub 困难时填写，留空直连 |
-| `ncm_api_base` | 空 | 外部 NeteaseCloudMusicApi 服务地址，如 `http://127.0.0.1:3000`。开启内置服务后本项被忽略；未开启时配置本项同样支持扫码登录。部署见 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) |
-| `meting_api` | `https://api.qijieya.cn/meting/` | Meting 镜像，官方接口失效时的备用音源（音质不可控），留空禁用 |
-| `quality` | `极高 320k` | 音质档位：标准 128k / 较高 192k / 极高 320k / 无损 FLAC / 高清臻音 Hi-Res / 超清母带。取不到自动回退；无损及以上需登录会员 |
-| `send_mode` | `auto` | `auto` 语音优先自动降级；`voice`/`file`/`card` 只发对应方式；`voice_card` 等下划线组合为同时多发 |
-| `load_mode` | `file` | `file`=本地路径（**推荐**，要求 AstrBot 与 NapCat 同机）；`url`=直链由协议端下载（跨机部署用，此模式不本地下载）；`base64`=编码内嵌（大文件会撑爆 WebSocket，慎用） |
-| `send_play_card` | `true` | 发送 CD 风播放卡片图 |
-| `send_comment_card` | `true` | 发送热评卡片 |
-| `send_lyrics_forward` | `true` | 发送歌词合并转发 |
-| `send_timeout` | `20` | 每种发送方式的超时秒数 |
-| `download_timeout` | `20` | 下载停滞超时：超过该秒数无新数据才判失败（慢速大文件不会被误杀），失败自动重试一次 |
-| `download_max_mb` | `40` | 超过此大小不下载，直接降级为卡片。无损/母带通常 30-100MB，用高音质请调大 |
-| `search_limit` | `5` | 选歌列表数量 |
-| `http_proxy` | 空 | HTTP 代理 |
+| `ncm_api_embedded` | `false` | 内置 API 开关 |
+| `ncm_api_embedded_port` | `13000` | 只监听 `127.0.0.1`，端口冲突需修改 |
+| `ncm_api_external_enabled` | `true` | 外部 API 独立开关，地址为空时不调用 |
+| `ncm_api_base` | 空 | 外部 API 根地址 |
+| `ncm_web_enabled` | `true` | 网页账号及网页音源阶段开关 |
+| `ncm_web_cookie_enabled` | `false` | 手动 Cookie 开关 |
+| `ncm_web_cookie` | 空 | 自己的网易云网页 Cookie |
+| `meting_enabled` | `true` | 镜像音源开关 |
+| `meting_api` | `https://api.qijieya.cn/meting/` | 可改为自己的 Meting 地址，留空不使用 |
+| `ncm_outer_enabled` | `true` | 最后一级官方音频外链开关 |
+| `ncm_api_github_acceleration` | `true` | 开启时加速站依次尝试，最后回退官方地址；关闭时只用官方 GitHub |
+| `ncm_api_github_accelerators` | `ghfast.top`、`gh-proxy.com` | 可编辑的有序 URL 前缀列表，所有下载均验证固定版本摘要 |
+| `ncm_api_embedded_mirror` | 空 | 兼容旧配置的优先加速前缀，失败后仍轮换，仅加速开启时生效 |
+| `ncm_api_log_output` | `false` | 将内置 API stdout/stderr 经常见敏感字段脱敏后转发到 AstrBot 日志 |
+| `quality` | `极高 320k` | 标准 / 较高 / 极高 / 无损 / Hi-Res / 母带 |
+| `load_mode` | `file` | `file` 本地路径；`url` 协议端下载；`base64` 内嵌发送 |
+| `send_mode` | `auto` | 语音优先降级，或 `voice` / `file` / `card` 及下划线组合 |
+| `send_play_card` / `send_comment_card` / `send_lyrics_forward` | `true` | 播放卡片、热评、歌词开关 |
+| `enable_keyword_listen` | `true` | 关键词点歌开关 |
+| `send_timeout` | `20` | 单种发送方式的超时秒数 |
+| `download_timeout` | `20` | 下载停滞超时秒数，失败重试一次 |
+| `download_max_mb` | `40` | 单个音源下载上限，超限后降质/换源；高音质通常需调大 |
+| `search_limit` | `5` | 搜索候选数量 |
+| `http_proxy` | 空 | 公网请求/Release 下载代理，本机 API 不经过代理 |
 
-## 为什么默认用 file 载入而不是 base64？
+`file` 适合 AstrBot 与协议端同机，在 aiocqhttp 平台通过原生 API 只传文件路径，避免大音频转 base64 撑大 WebSocket 消息。跨机部署可使用 `url`；`base64` 会增加消息体积。
 
-AstrBot 的 aiocqhttp 适配器会把 Record 组件统一转成 base64（且会转码为 wav）再塞进 WebSocket，
-一首歌轻松突破 ws 库的帧大小上限，协议端直接断开连接，表现为「点歌 60 秒超时」。
-本插件在 aiocqhttp 平台直接调用原生 API 发送，`file` 模式下 WebSocket 上只传一个路径字符串。
+## 数据目录与服务管理
 
-## 音源说明
+插件通过 `StarTools.get_data_dir("astrbot_plugin_ncm_player")` 获取 AstrBot 数据目录，通常为：
 
-播放地址按以下优先级获取：
-
-1. NeteaseCloudMusicApi 服务（内置 `ncm_api_embedded` 或外部 `ncm_api_base`，音质可控，登录后可达母带级）
-2. 网易云官方网页接口（无登录态时多数返回 -110，仅作尝试）
-3. `meting_api` 镜像（实测可用，音质不可控）
-4. 网易云官方外链兜底
-
-**试听片段识别与登录失效提示（v1.4.3+）**：接口返回带 `freeTrialInfo` 的地址时说明只拿到 30 秒试听（登录失效/未登录/账号非 VIP），插件不会把它发给用户，而是立即复核登录态并自动降级到 Meting 镜像下载完整歌曲；确认登录失效后，点歌时会先收到「登录失效，请重新扫码」提示（10 分钟内最多一次），扫码登录成功后立即复核并提示账号是否为 VIP。
-
-扫码和短信登录均使用新 Cookie 单独查询 `/login/status`，确认返回 UID 后才保存；有效登录必须同时满足：Cookie 含 `MUSIC_U` 登录凭证（`MUSIC_A` 只是游客 token，不算登录）、接口 `code` 为 200、非游客会话（`anonimous`）、`account.id` 与 `profile.userId` 为同一用户。扫码确认后若服务只下发游客态 Cookie、或复核发现串号，会明确提示并拒绝保存，原登录态不受影响。消息显示 UID 和未打码昵称（`userName` 可能是手机号，仍打码）；请与网易云 App 账号资料中的 UID/昵称对照，不要仅凭 `user/detail` 的非 200 响应、VIP 字段为 0 或设备记录认定登错账号。若权益与预期不符，检查外部公共 API 服务、自建服务、代理和接口缓存；本地退出不等于撤销 App 设备授权，设备显示「IP 未知」也不能单独定位原因。不要在公开群聊分享二维码、Cookie 或账号资料。
-
-**短信登录隐私与限制**：仅在管理员与机器人的私聊发送不带参数的命令，再按提示输入已绑定网易云账号的大陆手机号（默认国家码 86）和短信验证码。**不要在群聊、命令参数、日志或公开频道输入手机号/验证码**；聊天平台、适配器及其历史记录仍可能留存私聊内容，务必在可信环境操作；插件以 POST 表单提交敏感值以避免进入 API 服务的 URL 错误日志，但代理/网关若记录请求体仍有泄露风险，建议只使用可信自建服务。插件不会代收短信，也不会把验证码写入 Cookie 文件；退出登录会取消等待中的登录，失败不会替换原 Cookie。上游接口可能要求额外验证或限制发送/登录，无法保证绕过风控；若触发风控请停止重试并通过官方客户端处理。
-
-VIP / 无版权歌曲可能所有源都拿不到音频，此时会自动降级为音乐卡片或链接。
-
-## 目录结构
-
-```
-astrbot_plugin_ncm_player/
-├── main.py              # 插件入口：LLM 工具 + 指令 + 扫码/验证码登录 + 内置服务生命周期
-├── metadata.yaml        # 插件元数据
-├── _conf_schema.json    # WebUI 配置项
-├── requirements.txt
-├── bin/                 # 内置 NeteaseCloudMusicApi 预编译二进制（linux/win/mac，MIT 许可）
-└── core/
-    ├── ncm_api.py       # 网易云 API：搜索 / 封面 / 播放地址 / 热评 / 歌词 / 二维码/验证码登录 / 下载
-    ├── ncm_server.py    # 内置 NeteaseCloudMusicApi：二进制定位 + 子进程管理（默认关闭）
-    ├── renderer.py      # Pillow 渲染：CD 风选歌图、播放卡片、热评卡片
-    └── sender.py        # 语音 / 文件 / 卡片 / 链接 发送与降级
+```text
+data/plugin_data/astrbot_plugin_ncm_player/
+├── ncm_cookie.txt           # 扫码/短信账号，规范化后原子保存
+├── cache/                  # 音频、卡片和二维码
+└── ncm_api_server/
+    ├── ncm-api-<platform>   # 固定 Release 资产
+    └── runtime/            # 子进程专用 TMP/TEMP/TMPDIR
 ```
 
-## 内置服务说明
+手动 Cookie 及开关由 AstrBot 插件配置保存。运行时不向插件源码目录写程序、缓存或临时文件。上游的 `anonymous_token`、`xeapi_public_key` 被限制在子进程私有临时目录，删除/重装可清理；不会删除系统临时目录中的其他服务文件。启动验证 `/inner/version` 和目标版本，不把任意 HTTP 200 当作 API 已就绪。
 
-内置服务来自 [api-enhanced](https://github.com/neteasecloudmusicapienhanced/api-enhanced) 官方 Release 的预编译二进制（MIT 许可，允许分发，版权声明见该项目仓库）。
-插件包的 `bin/` 已包含 linux / Windows / macOS x64 二进制；开启 `ncm_api_embedded` 后复制到数据目录 `ncm_api_server/` 运行。仅当打包文件缺失时才尝试下载。关闭开关不会启动进程，已有副本保留以便下次使用；两个清理命令都不会删除服务二进制。
+## 开发验证
+
+```bash
+python -m pip install -r requirements.txt ruff
+python -m ruff check .
+python -m ruff format --check .
+python -m unittest discover -s tests -t . -v
+```
+
+测试用本地 aiohttp 服务覆盖真实 HTTP 请求、登录 Cookie、双账号、缓存隔离、下载回退和生命周期；仅 AstrBot 宿主接口使用替身。可额外设置 `NCM_RELEASE_SMOKE=1` 后运行 `python -m unittest tests.test_release_smoke -v`，验证真实 Release 下载、启动、重装及删除；该测试无需真实账号。
+
+## v1.5.0 历史瘦身
+
+本次不仅移除当前 `bin/`，还通过 `git-filter-repo` 从 Git 历史删除三个二进制（合计约 221 MB 原始文件），保留其余开发记录。历史提交哈希已重写，已有克隆建议备份本地工作后重新克隆。以后只在 AstrBot 数据目录按需下载 Release；备份包放在仓库外，未提交。
+
+## 开源致谢与许可
+
+- 本插件采用 [MIT](LICENSE)，保留 [astrbot_plugin_music](https://github.com/Zhalslar/astrbot_plugin_music) 的设计来源说明。
+- 内置服务下载自 [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)，固定版本 [v4.40.1](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/releases/tag/v4.40.1)。本次依据其公开接口独立实现客户端和进程管理；仓库不打包其二进制。
+- 上游 [v4.40.1/LICENSE](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/blob/v4.40.1/LICENSE) 原文如下：
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2013-2022 Binaryify
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```

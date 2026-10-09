@@ -1,26 +1,25 @@
-"""网易云音乐 API 封装。
-
-音源四级链路：
-1. 自建/公共 NeteaseCloudMusicApi 服务（支持二维码登录，音质可控到母带级）
-2. 网易云官方网页接口（无登录态时多数返回 -110，仅作尝试）
-3. Meting 镜像（音质不可控，通常 128-320k mp3）
-4. 网易云官方外链兜底
-
-登录态感知：
-- 接口返回带 freeTrialInfo 的地址 = 30 秒试听片段（登录失效/未登录/非会员），
-  绝不当作成功，立即复核登录态并自动降级到 Meting 镜像；
-- probe_login() 解析 /login/status 的 account 与 vipType，维护 login_valid/vip，
-  供插件在点歌时给出「登录失效」提示。
-"""
+"""网易云请求、独立账号快照及可继续迭代的多级音源链路。"""
 
 import asyncio
+import ipaddress
+import json
 import re
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field, replace
+from urllib.parse import urlsplit
 
 import aiohttp
-
 from astrbot.api import logger
+
+from .auth import (
+    AccountState,
+    has_music_u,
+    membership_status,
+    normalize_cookie,
+    parse_cookie,
+    response_cookie,
+)
 
 # 音质档位 -> (显示名, 官方接口码率, ncm_api level)
 QUALITY_LEVELS: dict[str, tuple[str, int, str]] = {
@@ -31,8 +30,8 @@ QUALITY_LEVELS: dict[str, tuple[str, int, str]] = {
     "hires": ("高清臻音 Hi-Res", 999000, "hires"),
     "jymaster": ("超清母带", 999000, "jymaster"),
 }
-# 取不到期望档位时的回退顺序
-LEVEL_FALLBACK = ["exhigh", "higher", "standard"]
+# 从用户选择的档位向下回退，不请求高于用户选择的档位。
+LEVEL_FALLBACK = list(reversed(QUALITY_LEVELS))
 
 # 配置值别名：中文档位名 / 旧版英文 key -> 内部 key
 QUALITY_ALIASES: dict[str, str] = {
@@ -73,12 +72,26 @@ class Song:
 @dataclass
 class PlayInfo:
     url: str
-    br: int = 0        # 实际码率，0 表示未知
-    size: int = 0      # 字节，0 表示未知
+    br: int = 0  # 实际码率，0 表示未知
+    size: int = 0  # 字节，0 表示未知
     ext: str = "mp3"
-    level: str = ""    # 音质档位 key，空表示未知来源
-    source: str = ""   # 来源：ncm / web / meting / outer
-    fee: int = 0       # 1=VIP 歌曲 4=付费专辑，0/8=免费（用于卡片 VIP 标记）
+    level: str = ""  # 音质档位 key，空表示未知来源
+    source: str = ""  # 来源：ncm / web / meting / outer
+    fee: int = 0  # 1=VIP 歌曲 4=付费专辑，0/8=免费（用于卡片 VIP 标记）
+    service: str = ""
+    credential: str = ""
+    account_uid: str = ""
+    authenticated: bool = False
+    fallback_reason: str = ""
+
+    @property
+    def source_label(self) -> str:
+        if self.source == "ncm":
+            account = "网页 Cookie" if self.credential == "web" else "API 账号"
+            return f"{self.service} / {account}"
+        return {"web": "官方网页", "meting": "Meting 镜像", "outer": "官方外链"}.get(
+            self.source, self.source
+        )
 
     @property
     def is_vip_song(self) -> bool:
@@ -96,11 +109,29 @@ class PlayInfo:
             return "Meting 镜像"
         if self.source == "outer":
             return "官方外链"
-        if self.br >= 999000:
+        if self.ext == "flac":
             return "无损"
         if self.br > 0:
             return f"{self.br // 1000}kbps"
         return "在线"
+
+
+@dataclass
+class PlaybackTrace:
+    """每次点歌独有；迭代器暂停下载时不会被其他点歌请求覆盖。"""
+
+    failures: list[str] = field(default_factory=list)
+    trial: bool = False
+    fee: int = 0
+
+    def record(self, source: str, reason: str):
+        message = f"{source}: {reason}"
+        if message not in self.failures:
+            self.failures.append(message)
+
+    @property
+    def summary(self) -> str:
+        return "；".join(self.failures)
 
 
 @dataclass
@@ -112,26 +143,6 @@ class Comment:
 
 
 _LRC_TAG = re.compile(r"\[[^\]]*\]")
-
-# MUSIC_U 是账号登录的唯一有效凭证；MUSIC_A 只是游客/匿名 token，
-# 绝不能单独作为“已登录”依据（扫码确认后服务偶发只下发游客态 Cookie，
-# 若误收下，两次扫码会复核出同一个游客账号：同 UID、无 VIP）。
-_MUSIC_U_RE = re.compile(r"(?:^|;)\s*MUSIC_U=[^;\s]+")
-
-
-def has_music_u(cookie: str) -> bool:
-    """Cookie 是否携带有效登录凭证 MUSIC_U"""
-    return bool(cookie and _MUSIC_U_RE.search(cookie))
-
-
-def cookie_keys(cookie: str) -> list[str]:
-    """Cookie 中的 key 名列表（仅名不含值，可安全进日志，用于诊断登录问题）"""
-    keys: list[str] = []
-    for part in (cookie or "").split(";"):
-        name = part.strip().partition("=")[0].strip()
-        if name and name not in keys:
-            keys.append(name)
-    return keys
 
 
 class NetEaseAPI:
@@ -147,7 +158,6 @@ class NetEaseAPI:
             "Chrome/124.0.0.0 Safari/537.36"
         ),
         "Referer": "https://music.163.com/",
-        "Cookie": "appver=2.0.2",
     }
 
     def __init__(
@@ -156,26 +166,27 @@ class NetEaseAPI:
         ncm_api_base: str = "",
         meting_api: str = "",
         cookie: str = "",
+        web_cookie: str = "",
+        web_cookie_enabled: bool = False,
+        web_enabled: bool = True,
+        meting_enabled: bool = True,
+        outer_enabled: bool = True,
     ):
         self.proxy = proxy or None
-        self.ncm_api_base = ncm_api_base.rstrip("/") if ncm_api_base else ""
-        self.meting_api = meting_api if meting_api else ""
-        self.cookie = cookie or ""
-        # 登录态：True/False 已确认，None 未知；点歌提示据此判断
-        self.login_valid: bool | None = None
-        self.vip: bool = False
-        self._login_check_ts: float = 0.0
-        # 已登录账号信息（用于登录结果提示）
-        self.account_uid: str = ""
-        self.account_nickname: str = ""
-        self.account_user_name: str = ""
-        self.account_anomaly: bool = False
-        self.login_detail_code: int | None = None
-        # 最近一次复核判无效的原因（"" / "no_credential" / "bad_code" / "guest" /
-        # "no_account" / "mismatch"），供调用方给出针对性提示
-        self.last_invalid_reason: str = ""
-        # 上一次取播放地址是否因「试听片段」降级（"" / "trial"）
-        self.last_fallback: str = ""
+        self.api_sources = (
+            [("外部 API", ncm_api_base.rstrip("/"))] if ncm_api_base else []
+        )
+        self.meting_api = meting_api or ""
+        self.cookie = normalize_cookie(cookie)
+        self.web_cookie = normalize_cookie(web_cookie) if web_cookie_enabled else ""
+        self.web_cookie_enabled = web_cookie_enabled
+        self.web_enabled = web_enabled
+        self.meting_enabled = meting_enabled
+        self.outer_enabled = outer_enabled
+        self.account = AccountState()
+        self.web_account = AccountState()
+        self._generation = 0
+        self._probe_locks = {"api": asyncio.Lock(), "web": asyncio.Lock()}
         # DummyCookieJar：禁用会话自动存/发 Cookie。
         # 否则登录接口 Set-Cookie 会被 CookieJar 记住，与手动传入的 Cookie 头叠加，
         # 可能出现重复/过期 MUSIC_U，导致会员鉴权时好时坏（VIP 歌偶尔变 30 秒试听）。
@@ -188,36 +199,78 @@ class NetEaseAPI:
     async def close(self):
         await self.session.close()
 
-    def _mark_invalid(self, reason: str = ""):
-        """登录态置为无效并清空账号信息（网络异常时不要调此函数，保留原状态）"""
-        self.login_valid = False
-        self.vip = False
-        self.account_uid = ""
-        self.account_nickname = ""
-        self.account_user_name = ""
-        self.account_anomaly = False
-        self.login_detail_code = None
-        self.last_invalid_reason = reason
+    @property
+    def ncm_api_base(self) -> str:
+        return self.api_sources[0][1] if self.api_sources else ""
+
+    def set_api_sources(self, sources: list[tuple[str, str]]):
+        """服务切换使旧复核失效；各播放请求仍持有自己的服务/凭据快照。"""
+        self.api_sources = list(
+            dict.fromkeys((name, url.rstrip("/")) for name, url in sources if url)
+        )
+        self._generation += 1
+        self.account = AccountState()
+        self.web_account = AccountState()
 
     def set_cookie(self, cookie: str):
-        self.cookie = cookie or ""
-        self._mark_invalid()
-        self._login_check_ts = 0.0
+        self.cookie = normalize_cookie(cookie)
+        self._generation += 1
+        self.account = AccountState()
+
+    def adopt_login(self, candidate: "NetEaseAPI"):
+        self.set_cookie(candidate.cookie)
+        self.account = candidate.account
+
+    def _proxy_for(self, url: str):
+        """本机 API 不经过用户为公网网易云配置的 HTTP 代理。"""
+        host = urlsplit(url).hostname or ""
+        if host.lower() == "localhost":
+            return None
+        try:
+            if ipaddress.ip_address(host).is_loopback:
+                return None
+        except ValueError:
+            pass
+        return self.proxy
 
     def _auth_headers(self, cookie: str | None = None) -> dict:
         h = dict(self.HEADERS)
         value = self.cookie if cookie is None else cookie
-        h["Cookie"] = f"appver=2.0.2; {value}" if value else "appver=2.0.2"
-        # 登录相关请求禁缓存：NeteaseCloudMusicApi 的 apicache 按 URL 缓存响应，
-        # 鉴权类接口一旦命中旧缓存就会串号/复核错账号
+        h["Cookie"] = normalize_cookie(value)
+        # 上游 apicache 仅认专用 bypass 头；普通 no-cache 只供中间代理参考。
+        h["X-Apicache-Bypass"] = "true"
         h["Cache-Control"] = "no-cache"
         h["Pragma"] = "no-cache"
         return h
 
-    async def _get(self, url: str, auth: bool = False, cookie: str | None = None, **kwargs):
+    async def _api_request(
+        self, path: str, *, base: str = "", cookie: str | None = None, **params
+    ):
+        """凭据在 POST 对象中传递，绕过上游严格的 Cookie 字符串解析。
+
+        URL 只放随机缓存键；避免凭据出现在访问日志，同时隔离忽略请求体的缓存。
+        """
+        url = f"{base or self.ncm_api_base}{path}"
+        value = self.cookie if cookie is None else cookie
+        async with self.session.post(
+            url,
+            json={**params, "cookie": parse_cookie(value)},
+            params={"timestamp": self._ts(), "_ncm_nonce": uuid.uuid4().hex},
+            headers=self._auth_headers(value),
+            proxy=self._proxy_for(url),
+        ) as resp:
+            resp.raise_for_status()
+            result = await resp.json(content_type=None)
+            if not isinstance(result, dict):
+                raise ValueError("API 未返回 JSON 对象")
+            return result
+
+    async def _get(
+        self, url: str, auth: bool = False, cookie: str | None = None, **kwargs
+    ):
         headers = self._auth_headers(cookie) if auth else None
         async with self.session.get(
-            url, proxy=self.proxy, headers=headers, **kwargs
+            url, proxy=self._proxy_for(url), headers=headers, **kwargs
         ) as resp:
             resp.raise_for_status()
             return await resp.json(content_type=None)
@@ -266,106 +319,157 @@ class NetEaseAPI:
 
     @staticmethod
     def _is_trial(d: dict) -> bool:
-        """响应带 freeTrialInfo = 返回的是 30 秒试听片段（登录失效/未登录/非会员）。
-        此类 URL 绝不当作成功，否则用户收到的永远是试听部分。"""
-        return bool(d.get("freeTrialInfo"))
+        """上游可能返回 null 或字符串 'null'，只有实质试听信息才拒绝。"""
+        value = d.get("freeTrialInfo")
+        if isinstance(value, str):
+            if value.strip().lower() in ("", "null", "none", "false", "0"):
+                return False
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return True
+        return bool(value)
 
     async def get_play_info(self, song_id: int, quality: str) -> PlayInfo | None:
-        """按音质档位获取播放地址，逐级回退；遇到试听片段自动复核登录态并降级 Meting"""
-        prefer = QUALITY_LEVELS.get(quality, QUALITY_LEVELS["exhigh"])
-        self.last_fallback = ""
+        """兼容仅需链接的调用；下载调用应使用 iter_play_info 继续回退。"""
+        async for info in self.iter_play_info(song_id, quality):
+            return info
+        return None
 
-        # 1. NeteaseCloudMusicApi 服务（支持登录 cookie，可到母带级）
-        if self.ncm_api_base:
-            levels = list(dict.fromkeys([prefer[2], *LEVEL_FALLBACK]))
-            trial = False
-            for lv in levels:
-                try:
-                    # timestamp 破缓存：服务端 apicache 按 URL 缓存、不区分 Cookie，
-                    # 否则匿名期请求过的歌会长期命中 30 秒试听的缓存结果
-                    result = await self._get(
-                        f"{self.ncm_api_base}/song/url/v1",
-                        auth=True,
-                        params={"id": song_id, "level": lv, "timestamp": self._ts()},
-                    )
-                    d = (result.get("data") or [{}])[0]
-                    if not d.get("url"):
-                        continue
-                    if self._is_trial(d):
-                        # 试听片段：换档位也是试听，立即复核登录态并跳出，降级镜像
-                        logger.warning(
-                            f"[ncm_player] 歌曲 {song_id} 仅返回试听片段"
-                            f"（freeTrialInfo），登录态失效或账号非会员，自动降级镜像"
-                        )
-                        trial = True
-                        await self.probe_login()
-                        trial_fee = int(d.get("fee", 0) or 0)
-                        break
-                    return PlayInfo(
-                        url=d["url"],
-                        br=d.get("br", 0),
-                        size=d.get("size", 0),
-                        ext=(d.get("type") or "mp3").lower(),
-                        level=lv,
-                        source="ncm",
-                        fee=int(d.get("fee", 0) or 0),
-                    )
-                except Exception as e:
-                    logger.warning(f"[ncm_player] ncm_api 取地址失败(level={lv}): {e}")
-            if trial:
-                # 官方网页接口无登录态同样只会给试听，直接进入 Meting 镜像
-                return self._meting_or_outer(song_id, reason="trial", fee=trial_fee)
-
-        # 2. 官方网页接口，按码率回退
-        brs = sorted(
-            {prefer[1], *[QUALITY_LEVELS[k][1] for k in LEVEL_FALLBACK]},
-            reverse=True,
-        )
-        for br in brs:
-            try:
-                result = await self._get(
-                    self.PLAY_URL, params={"ids": f"[{song_id}]", "br": br}
-                )
-                data = (result.get("data") or [{}])[0]
-                if not data.get("url"):
-                    continue
-                if self._is_trial(data):
-                    logger.warning(
-                        f"[ncm_player] 歌曲 {song_id} 官方接口仅返回试听片段，自动降级镜像"
-                    )
-                    await self.probe_login()
-                    return self._meting_or_outer(song_id, reason="trial")
-                return PlayInfo(
-                    url=data["url"],
-                    br=data.get("br", br),
-                    size=data.get("size", 0),
-                    ext=(data.get("type") or "mp3").lower(),
-                    source="web",
-                )
-            except Exception as e:
-                logger.warning(f"[ncm_player] 官方接口取地址失败(br={br}): {e}")
-
-        # 3/4. Meting 镜像 → 官方外链兜底
-        return self._meting_or_outer(song_id)
-
-    def _meting_or_outer(self, song_id: int, reason: str = "", fee: int = 0) -> PlayInfo:
-        """Meting 镜像 → 官方外链。reason='trial' 表示因试听片段降级；fee 透传 VIP 标记"""
-        if reason == "trial":
-            self.last_fallback = "trial"
-        if self.meting_api:
-            sep = "&" if "?" in self.meting_api else "?"
-            return PlayInfo(
-                url=f"{self.meting_api}{sep}server=netease&type=url&id={song_id}",
-                br=0,
-                size=0,
-                ext="mp3",
-                source="meting",
-                fee=fee,
-            )
+    @staticmethod
+    def _play_info(
+        data: dict, source: str, trace: PlaybackTrace, **kwargs
+    ) -> PlayInfo | None:
+        label = kwargs.get("service") or {"web": "官方网页"}.get(source, source)
+        if kwargs.get("service") and kwargs.get("credential"):
+            label += f"/{kwargs['credential']}"
+        trace.fee = int(data.get("fee") or trace.fee)
+        if NetEaseAPI._is_trial(data):
+            trace.trial = True
+            trace.record(label, "仅试听")
+            return None
+        url = data.get("url")
+        if not isinstance(url, str) or urlsplit(url).scheme not in ("http", "https"):
+            trace.record(label, "无可用音频")
+            return None
+        ext = str(data.get("type") or "mp3").lower()
+        # 音频类型来自服务响应，只允许文件扩展名，不能进入任意路径。
+        if ext not in ("mp3", "flac", "m4a", "aac", "ogg", "wav"):
+            ext = "mp3"
         return PlayInfo(
-            url=f"{self.OUTER_URL}?id={song_id}.mp3", br=0, size=0, ext="mp3",
-            source="outer", fee=fee,
+            url=url,
+            br=int(data.get("br") or 0),
+            size=int(data.get("size") or 0),
+            ext=ext,
+            level=str(data.get("level") or ""),
+            source=source,
+            fee=trace.fee,
+            fallback_reason=trace.summary,
+            **kwargs,
         )
+
+    async def iter_play_info(
+        self, song_id: int, quality: str, trace: PlaybackTrace | None = None
+    ):
+        """API 账号(内→外) → 网页 Cookie(内→外→直连) → 镜像 → 外链。
+
+        每次 yield 后调用方可下载/探测；失败后继续迭代，避免取得坏链接就结束回退。
+        Cookie 和服务列表在首次请求前快照，切换账号不会在一首歌中混用凭据。
+        """
+        trace = trace if trace is not None else PlaybackTrace()
+        sources = tuple(self.api_sources)
+        cookie, web_cookie = self.cookie, self.web_cookie
+        generation = self._generation
+        quality = normalize_quality(quality)
+        levels = LEVEL_FALLBACK[LEVEL_FALLBACK.index(quality) :]
+        seen = set()
+        credentials = [("api", cookie)]
+        if self.web_enabled and self.web_cookie_enabled and has_music_u(web_cookie):
+            credentials.append(("web", web_cookie))
+
+        for credential, value in credentials:
+            if value and generation == self._generation:
+                await self.probe_login(credential=credential)
+            account = self.web_account if credential == "web" else self.account
+            if generation != self._generation:
+                account = AccountState()
+            for service, base in sources:
+                label = f"{service}/{credential}"
+                for level in levels:
+                    try:
+                        result = await self._api_request(
+                            "/song/url/v1",
+                            base=base,
+                            cookie=value,
+                            id=song_id,
+                            level=level,
+                        )
+                        data = (result.get("data") or [{}])[0]
+                        info = self._play_info(
+                            data,
+                            "ncm",
+                            trace,
+                            service=service,
+                            credential=credential,
+                            account_uid=account.uid,
+                            authenticated=account.login_valid is True,
+                        )
+                    except Exception as exc:
+                        trace.record(label, f"请求失败({type(exc).__name__})")
+                        # 网络/服务错误不因换音质而恢复，直接切换服务。
+                        break
+                    if info and info.url not in seen:
+                        seen.add(info.url)
+                        yield info
+
+        if self.web_enabled:
+            value = web_cookie if self.web_cookie_enabled else ""
+            account = (
+                self.web_account if generation == self._generation else AccountState()
+            )
+            for br in dict.fromkeys(QUALITY_LEVELS[level][1] for level in levels):
+                try:
+                    result = await self._get(
+                        self.PLAY_URL,
+                        auth=True,
+                        cookie=value,
+                        params={
+                            "ids": f"[{song_id}]",
+                            "br": br,
+                            "timestamp": self._ts(),
+                        },
+                    )
+                    data = (result.get("data") or [{}])[0]
+                    info = self._play_info(
+                        data,
+                        "web",
+                        trace,
+                        credential="web" if value else "",
+                        account_uid=account.uid,
+                        authenticated=account.login_valid is True,
+                    )
+                except Exception as exc:
+                    trace.record("官方网页", f"请求失败({type(exc).__name__})")
+                    break
+                if info and info.url not in seen:
+                    seen.add(info.url)
+                    yield info
+
+        if self.meting_enabled and self.meting_api:
+            sep = "&" if "?" in self.meting_api else "?"
+            yield PlayInfo(
+                url=f"{self.meting_api}{sep}server=netease&type=url&id={song_id}",
+                source="meting",
+                fee=trace.fee,
+                fallback_reason=trace.summary,
+            )
+        if self.outer_enabled:
+            yield PlayInfo(
+                url=f"{self.OUTER_URL}?id={song_id}.mp3",
+                source="outer",
+                fee=trace.fee,
+                fallback_reason=trace.summary,
+            )
 
     # ---------- 热评 / 歌词 ----------
 
@@ -419,221 +523,247 @@ class NetEaseAPI:
         旧版固定 timestamp=0 会导致扫码状态被缓存，迟迟查不到登录成功"""
         return int(time.time() * 1000)
 
-    async def qr_key(self) -> str:
-        result = await self._get(
-            f"{self.ncm_api_base}/login/qr/key",
-            params={"timestamp": self._ts()},
-        )
+    async def qr_key(self, base: str = "") -> str:
+        result = await self._api_request("/login/qr/key", base=base, cookie="")
         return (result.get("data") or {})["unikey"]
 
-    async def qr_create(self, key: str) -> str:
+    async def qr_create(self, key: str, base: str = "") -> str:
         """返回二维码图片的 base64 data-uri"""
-        result = await self._get(
-            f"{self.ncm_api_base}/login/qr/create",
-            params={"key": key, "qrimg": "true", "timestamp": self._ts()},
+        result = await self._api_request(
+            "/login/qr/create", base=base, cookie="", key=key, qrimg="true"
         )
         return (result.get("data") or {})["qrimg"]
 
-    async def qr_check(self, key: str) -> tuple[int, str]:
+    async def qr_check(self, key: str, base: str = "") -> tuple[int, str]:
         """轮询扫码状态。返回 (code, cookie)。800 过期 801 等待 802 待确认 803 成功。
 
         只在 803 时提取新 Cookie；响应体优先，补充 Set-Cookie 中缺少的字段，
         避免登录成功却拿到空 cookie（表现为重启/刷新后"掉登录"）。
         """
-        async with self.session.get(
-            f"{self.ncm_api_base}/login/qr/check",
-            proxy=self.proxy,
+        url = f"{base or self.ncm_api_base}/login/qr/check"
+        async with self.session.post(
+            url,
+            proxy=self._proxy_for(url),
             headers=self._auth_headers(""),
-            params={"key": key, "timestamp": self._ts()},
+            json={"key": key, "cookie": {}},
+            params={"timestamp": self._ts(), "_ncm_nonce": uuid.uuid4().hex},
         ) as resp:
             resp.raise_for_status()
             result = await resp.json(content_type=None)
             code = int(result.get("code", 0))
             if code != 803:
                 return code, ""
-            cookie = result.get("cookie", "") or ""
-            raw = resp.headers.getall("Set-Cookie", [])
-            pairs = [c.split(";", 1)[0].strip() for c in raw if "=" in c.split(";", 1)[0]]
-            existing = {part.strip().partition("=")[0] for part in cookie.split(";")}
-            cookie = "; ".join([cookie, *(p for p in pairs if p.partition("=")[0] not in existing)]).strip("; ")
-            return code, cookie
+            return code, response_cookie(
+                result.get("cookie", ""), resp.headers.getall("Set-Cookie", [])
+            )
 
-    async def send_captcha(self, phone: str, countrycode: str = "86") -> None:
+    async def send_captcha(
+        self, phone: str, countrycode: str = "86", base: str = ""
+    ) -> None:
         """发送短信；请求和异常中的敏感参数不得进入日志或聊天。"""
         try:
-            async with self.session.post(
-                f"{self.ncm_api_base}/captcha/sent",
-                proxy=self.proxy,
-                headers=self._auth_headers(""),
-                data={"phone": phone, "ctcode": countrycode, "timestamp": self._ts()},
-            ) as resp:
-                resp.raise_for_status()
-                result = await resp.json(content_type=None)
+            result = await self._api_request(
+                "/captcha/sent", base=base, cookie="", phone=phone, ctcode=countrycode
+            )
             if result.get("code") != 200:
-                raise ValueError("验证码发送未成功；可能受到风控，请稍后在官方客户端确认")
+                raise ValueError(
+                    "验证码发送未成功；可能受到风控，请稍后在官方客户端确认"
+                )
         except Exception:
-            raise ValueError("验证码发送失败或受到风控；请检查服务或稍后在官方客户端确认") from None
+            raise ValueError(
+                "验证码发送失败或受到风控；请检查服务或稍后在官方客户端确认"
+            ) from None
 
-    async def login_cellphone(self, phone: str, captcha: str, countrycode: str = "86") -> str:
+    async def login_cellphone(
+        self, phone: str, captcha: str, countrycode: str = "86", base: str = ""
+    ) -> str:
         """返回新的认证 Cookie；仅采用本次响应，不使用已有会话 Cookie。"""
         try:
+            url = f"{base or self.ncm_api_base}/login/cellphone"
             async with self.session.post(
-                f"{self.ncm_api_base}/login/cellphone",
-                proxy=self.proxy,
+                url,
+                proxy=self._proxy_for(url),
                 headers=self._auth_headers(""),
-                data={"phone": phone, "countrycode": countrycode,
-                      "captcha": captcha, "timestamp": self._ts()},
+                json={
+                    "phone": phone,
+                    "countrycode": countrycode,
+                    "captcha": captcha,
+                    "cookie": {},
+                },
+                params={"timestamp": self._ts(), "_ncm_nonce": uuid.uuid4().hex},
             ) as resp:
                 resp.raise_for_status()
                 result = await resp.json(content_type=None)
                 if result.get("code") != 200:
-                    raise ValueError("验证码登录未成功；请核对验证码，若受风控请停止重试")
-                cookie = result.get("cookie") or ""
-                if not isinstance(cookie, str):
-                    cookie = ""
-                existing = {part.strip().partition("=")[0] for part in cookie.split(";")}
-                pairs = [part.split(";", 1)[0].strip()
-                         for part in resp.headers.getall("Set-Cookie", [])]
-                cookie = "; ".join([cookie, *(part for part in pairs
-                                           if "=" in part and part.partition("=")[0] not in existing)]).strip("; ")
+                    raise ValueError(
+                        "验证码登录未成功；请核对验证码，若受风控请停止重试"
+                    )
+                cookie = response_cookie(
+                    result.get("cookie", ""), resp.headers.getall("Set-Cookie", [])
+                )
                 if not has_music_u(cookie):
                     raise ValueError("服务未返回可用的新认证 Cookie；原登录态未更改")
                 return cookie
         except Exception:
-            raise ValueError("验证码登录请求失败或受到风控；请检查服务或稍后重试") from None
+            raise ValueError(
+                "验证码登录请求失败或受到风控；请检查服务或稍后重试"
+            ) from None
 
     # 登录态复核防抖间隔（秒）：避免每首 VIP 歌都重复打 /login/status
     LOGIN_CHECK_INTERVAL = 60
 
-    async def probe_login(self, force: bool = False) -> bool:
-        """复核登录态与会员身份，维护 login_valid / vip。返回当前登录是否有效。
-
-        - 明确响应（有/无 account）才会翻转状态；网络异常保留既有状态，
-          避免一次抖动把「已登录」误判成「失效」导致误报提示。
-        - 60 秒防抖（force=True 强制复核，用于扫码登录成功后立即确认）。
-        - 有效登录必须同时满足：Cookie 含 MUSIC_U（MUSIC_A 只是游客 token）、
-          接口 code 为 200、account 非游客(anonimous)、account.id 与
-          profile.userId 为同一用户。任一不满足即判无效，绝不把游客会话
-          或串号的缓存响应存成登录态。
-        """
-        if not self.ncm_api_base or not has_music_u(self.cookie):
-            self._mark_invalid("no_credential")
-            return False
-        if not force and time.time() - self._login_check_ts < self.LOGIN_CHECK_INTERVAL:
-            return bool(self.login_valid)
-        self._login_check_ts = time.time()
-        try:
-            result = await self._get(
-                f"{self.ncm_api_base}/login/status",
+    async def _probe_account(
+        self, cookie: str, service: str, base: str
+    ) -> AccountState:
+        async def request(path: str, direct: str, **params):
+            if base:
+                return await self._api_request(path, base=base, cookie=cookie, **params)
+            return await self._get(
+                f"https://music.163.com{direct}",
                 auth=True,
-                params={"timestamp": self._ts()},
+                cookie=cookie,
+                params={**params, "timestamp": self._ts()},
             )
-            # 兼容两种响应结构：{data:{account,profile}} 或顶层 {account,profile}
-            data = result.get("data") or result
-            status_code = data.get("code")
-            account = data.get("account") or {}
-            profile = data.get("profile") or {}
-            keys = cookie_keys(self.cookie)
-            if status_code is not None and int(status_code) != 200:
-                self._mark_invalid("bad_code")
-                logger.warning(
-                    f"[ncm_player] 登录复核：接口返回 code={status_code}，"
-                    f"判为未登录(cookie_keys={keys})"
-                )
-                return False
-            if account.get("anonimous") or account.get("anonymous"):
-                # 游客/匿名会话：扫码只拿到游客态 Cookie 时走这里。
-                # 此前版本误判为有效登录，导致多次扫码复核出同一个游客账号。
-                self._mark_invalid("guest")
-                logger.warning(
-                    "[ncm_player] 登录复核：当前为游客/匿名会话(anonimous)，"
-                    f"非账号登录(cookie_keys={keys})；请重新扫码确认"
-                )
-                return False
-            account_uid = str(account.get("id") or "")
-            profile_uid = str(profile.get("userId") or profile.get("id") or "")
-            nickname = str(profile.get("nickname") or "")
-            if not account_uid:
-                self._mark_invalid("no_account")
-                logger.warning(
-                    f"[ncm_player] 登录复核：cookie 已失效（接口未返回账号信息，"
-                    f"cookie_keys={keys}）"
-                )
-                return False
-            if profile_uid and profile_uid != account_uid:
-                # account 与 profile 不是同一用户：多半是服务端缓存串号。
-                # 拒绝保存，要求重扫，避免“换号扫出旧账号”。
-                self._mark_invalid("mismatch")
-                logger.warning(
-                    f"[ncm_player] 登录复核：account.id={account_uid} 与 "
-                    f"profile.userId={profile_uid} 不一致，疑似接口缓存串号，"
-                    "拒绝保存本次登录态"
-                )
-                return False
-            login_valid = True
-            # 规范 UID 以 profile.userId（App 可见 ID）为准
-            account_uid = profile_uid or account_uid
-            account_user_name = str(account.get("userName") or "")
-            account_anomaly = False
-            login_detail_code = None
-            # VIP 判定取三个来源的最大值：
-            # 1) login/status 的 account.vipType（账号对象自带该字段）
-            # 2) login/status 的 profile.vipType（轻量接口经常不返回）
-            # 3) /user/detail 完整 profile 的 vipType（兜底二次确认）
-            vip_type = max(
-                int(account.get("vipType") or 0),
-                int(profile.get("vipType") or 0),
+
+        result = await request("/login/status", "/api/nuser/account/get")
+        data = result.get("data") or result
+        account, profile = data.get("account") or {}, data.get("profile") or {}
+        reason = ""
+        code = data.get("code", result.get("code", 200))
+        uid = str(account.get("id") or "")
+        profile_uid = str(profile.get("userId") or profile.get("id") or "")
+        if int(code) != 200:
+            # 风控/服务错误不是 cookie 已过期的直接证据。
+            if int(code) not in (301, 401):
+                raise ValueError(f"账号接口 code={code}")
+            reason = "bad_code"
+        elif account.get("anonimous") or account.get("anonymous"):
+            reason = "guest"
+        elif not uid:
+            reason = "no_account"
+        elif profile_uid and uid != profile_uid:
+            reason = "mismatch"
+        if reason:
+            return AccountState(
+                login_valid=False,
+                reason=reason,
+                service=service,
+                checked_at=time.monotonic(),
             )
-            detail_vip_type: int | None = None
-            detail_code: int | None = None
-            if not vip_type:
+
+        profiles = [account, profile]
+        membership, error = {}, ""
+        try:
+            membership = await request(
+                "/vip/info",
+                "/api/music-vip-membership/front/vip/info",
+                uid=uid,
+                userId=uid,
+            )
+            if membership.get("code") != 200:
+                error = "会员接口未返回成功状态"
+            member_uid = str((membership.get("data") or {}).get("userId") or "")
+            if member_uid and member_uid != uid:
+                membership = {}
+                error = "会员接口 UID 不一致"
+        except Exception as exc:
+            membership = {}
+            error = f"会员查询失败({type(exc).__name__})"
+        vip, label = membership_status(membership, profiles)
+        if vip is None and base:
+            try:
+                detail = await request("/user/detail", "", uid=uid)
+                p = detail.get("profile") or {}
+                if detail.get("code") == 200 and str(p.get("userId") or "") == uid:
+                    profiles.append(p)
+                    vip, label = membership_status(membership, profiles)
+            except Exception:
+                pass
+        return AccountState(
+            login_valid=True,
+            vip=vip,
+            membership=label,
+            uid=profile_uid or uid,
+            nickname=str(profile.get("nickname") or ""),
+            user_name=str(account.get("userName") or ""),
+            error=error,
+            service=service,
+            checked_at=time.monotonic(),
+        )
+
+    async def probe_login(self, force: bool = False, credential: str = "api") -> bool:
+        """防抖复核；只有快照代数仍一致才能发布结果，旧请求不能覆盖新登录。"""
+        attr = "web_account" if credential == "web" else "account"
+        async with self._probe_locks[credential]:
+            previous = getattr(self, attr)
+            if (
+                not force
+                and time.monotonic() - previous.checked_at < self.LOGIN_CHECK_INTERVAL
+            ):
+                return previous.login_valid is True
+            generation = self._generation
+            cookie = self.web_cookie if credential == "web" else self.cookie
+            if not has_music_u(cookie):
+                setattr(
+                    self,
+                    attr,
+                    AccountState(
+                        login_valid=False,
+                        reason="no_credential",
+                        checked_at=time.monotonic(),
+                    ),
+                )
+                return False
+            sources = tuple(self.api_sources) or (("官方网页", ""),)
+            checked, errors = [], []
+            for service, base in sources:
                 try:
-                    detail = await self._get(
-                        f"{self.ncm_api_base}/user/detail",
-                        auth=True,
-                        params={"uid": account_uid, "timestamp": self._ts()},
-                    )
-                    detail_code = detail.get("code")
-                    login_detail_code = detail_code
-                    if detail_code is not None and int(detail_code) != 200:
-                        account_anomaly = True
-                    detail_vip_type = int(
-                        (detail.get("profile") or {}).get("vipType") or 0
-                    )
-                    vip_type = max(vip_type, detail_vip_type)
-                except Exception:
-                    logger.warning("[ncm_player] 获取用户详情失败（按非 VIP 处理）")
-            self.login_valid = True
-            self.last_invalid_reason = ""
-            self.account_uid = account_uid
-            self.account_nickname = nickname
-            self.account_user_name = account_user_name
-            self.account_anomaly = account_anomaly
-            self.login_detail_code = login_detail_code
-            self.vip = bool(vip_type)
-            logger.info(
-                f"[ncm_player] 登录复核：uid={account_uid or '无'}, "
-                f"nickname={nickname or '无'}, "
-                f"account.vipType={account.get('vipType')}, "
-                f"profile.vipType={profile.get('vipType')}, "
-                f"user/detail.code={detail_code if detail_code is not None else '未查询'}, "
-                f"user/detail.vipType={detail_vip_type if detail_vip_type is not None else '未查询'}, "
-                f"VIP字段判定={'是' if self.vip else '否'}"
-            )
-            if account_anomaly:
-                logger.warning(
-                    f"[ncm_player] uid={account_uid} 的 user/detail 返回 {detail_code}，"
-                    "该结果不能单独证明账号归属或会员状态，请核对 App UID 与服务来源"
+                    state = await self._probe_account(cookie, service, base)
+                    checked.append(state)
+                    if state.login_valid:
+                        break
+                except Exception as exc:
+                    errors.append(f"{service}: {type(exc).__name__}")
+            if generation != self._generation:
+                return False
+            valid = next((state for state in checked if state.login_valid), None)
+            if valid:
+                state = valid
+            elif errors:
+                state = replace(
+                    previous, error="；".join(errors), checked_at=time.monotonic()
                 )
-        except Exception:
-            logger.warning("[ncm_player] 登录状态校验失败（保留原状态）")
-        return bool(self.login_valid)
+            else:
+                state = checked[-1]
+            setattr(self, attr, state)
+            return state.login_valid is True
 
     async def check_login(self) -> bool:
         """校验当前 cookie 是否仍有效（用于启动时提示登录状态）"""
         return await self.probe_login(force=True)
 
     # ---------- 下载 ----------
+
+    async def check_audio_url(self, url: str) -> bool:
+        """URL 发送模式只读少量响应，不在本机下载整首音频。"""
+        try:
+            async with self.session.get(
+                url,
+                proxy=self._proxy_for(url),
+                headers={"Range": "bytes=0-1023"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                resp.raise_for_status()
+                self._check_audio_type(resp)
+                return bool(await resp.content.read(1024))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _check_audio_type(resp):
+        ctype = (resp.content_type or "").lower()
+        if not (ctype.startswith("audio/") or ctype == "application/octet-stream"):
+            raise ValueError(f"返回的不是音频(content-type={ctype})")
 
     async def fetch_bytes(self, url: str, timeout: int = 10) -> bytes | None:
         """下载小文件（封面图、头像等）"""
@@ -660,20 +790,13 @@ class NetEaseAPI:
             try:
                 async with self.session.get(
                     url,
-                    proxy=self.proxy,
+                    proxy=self._proxy_for(url),
                     timeout=aiohttp.ClientTimeout(
                         total=None, connect=10, sock_connect=10, sock_read=timeout
                     ),
                 ) as resp:
                     resp.raise_for_status()
-                    ctype = (resp.content_type or "").lower()
-                    if ctype and not (
-                        ctype.startswith("audio")
-                        or ctype == "application/octet-stream"
-                    ):
-                        raise ValueError(
-                            f"返回的不是音频(content-type={ctype})，歌曲可能不可用"
-                        )
+                    self._check_audio_type(resp)
                     length = resp.content_length or 0
                     if length and length > limit:
                         raise ValueError(
@@ -685,6 +808,8 @@ class NetEaseAPI:
                             if written > limit:
                                 raise ValueError(f"文件超过下载上限 {max_mb}MB")
                             f.write(chunk)
+                if not written:
+                    raise ValueError("音频响应为空")
                 return written
             except Exception as e:
                 last_err = e
