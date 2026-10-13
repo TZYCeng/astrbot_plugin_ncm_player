@@ -1,6 +1,6 @@
 # 网易云点歌 · astrbot_plugin_ncm_player
 
-为 AstrBot 设计的网易云点歌插件。设计思路参考 [Zhalslar/astrbot_plugin_music](https://github.com/Zhalslar/astrbot_plugin_music)，针对语音超时、音源回退和账号登录重新实现。
+为 AstrBot 设计的网易云点歌插件。针对语音超时、音源回退和账号登录重新实现。
 
 [![Version](https://img.shields.io/badge/version-v1.5.0-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_ncm_player)
 [![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/)
@@ -137,7 +137,7 @@ python -m unittest discover -s tests -t . -v
 
 ## 开源致谢与许可
 
-- 本插件采用 [MIT](LICENSE)，保留 [astrbot_plugin_music](https://github.com/Zhalslar/astrbot_plugin_music) 的设计来源说明。
+- 本插件采用 [MIT](LICENSE)。
 - 内置服务下载自 [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)，固定版本 [v4.40.1](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/releases/tag/v4.40.1)。本次依据其公开接口独立实现客户端和进程管理；仓库不打包其二进制。
 - 上游 [v4.40.1/LICENSE](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/blob/v4.40.1/LICENSE) 原文如下：
 
