@@ -94,6 +94,7 @@ API 账号与网页账号的会员信息独立，VIP 查询异常不覆盖已确
 | `ncm_api_log_output` | `false` | 将内置 API stdout/stderr 经常见敏感字段脱敏后转发到 AstrBot 日志 |
 | `quality` | `极高 320k` | 标准 / 较高 / 极高 / 无损 / Hi-Res / 母带 |
 | `load_mode` | `file` | `file` 本地路径；`url` 协议端下载；`base64` 内嵌发送 |
+| `guest_path_style` | `auto` | 默认保留路径或使用 `PATH_CONVERT` 映射；`windows` / `linux` 校验目标路径类型 |
 | `send_mode` | `auto` | 语音优先降级，或 `voice` / `file` / `card` 及下划线组合 |
 | `send_play_card` / `send_comment_card` / `send_lyrics_forward` | `true` | 播放卡片、热评、歌词开关 |
 | `enable_keyword_listen` | `true` | 关键词点歌开关 |
@@ -103,7 +104,40 @@ API 账号与网页账号的会员信息独立，VIP 查询异常不覆盖已确
 | `search_limit` | `5` | 搜索候选数量 |
 | `http_proxy` | 空 | 公网请求/Release 下载代理，本机 API 不经过代理 |
 
-`file` 适合 AstrBot 与协议端同机，在 aiocqhttp 平台通过原生 API 只传文件路径，避免大音频转 base64 撑大 WebSocket 消息。跨机部署可使用 `url`；`base64` 会增加消息体积。
+### Docker 与跨系统发送
+
+以下说明针对 aiocqhttp / OneBot 原生发送链路；其他平台由 AstrBot 适配器处理。
+
+| AstrBot / 协议端部署 | `file` 语音与文件发送 | `base64` 语音 | `url` 语音 |
+| --- | --- | --- | --- |
+| Linux / Linux，同一可见路径 | 无需映射，协议端须有读取权限 | 无需共享路径 | 协议端须能下载直链 |
+| Linux Docker / Linux 宿主或另一个容器 | 共享目录；路径不同则配置映射 | 无需共享路径 | 同上 |
+| Linux Docker / Windows 宿主 | 绑定挂载同一目录，映射到 Windows 实际路径 | 无需共享路径 | 同上 |
+| Windows / Windows | 同路径直接使用；不同共享路径配置映射 | 无需共享路径 | 同上 |
+| Windows / Linux 或跨机器 | 必须另行共享文件并配置映射 | 无需共享路径 | 同上 |
+| macOS / POSIX 协议端 | 按 Linux 路径规则处理 | 无需共享路径 | 同上 |
+
+这些是代码支持的部署条件，不代表在所有协议端版本上实机验证通过。协议端还须支持对应音频格式与 API。
+
+`guest_path_style=auto`（默认）有映射时转换，无映射时保留路径，不从 AstrBot 的系统推断协议端系统。`windows` / `linux` 仅校验目标路径类型；设置 `windows` 不会自动猜测 `C:\AstrBot`。从旧版自动猜测行为迁移时，需要补充实际目录映射。
+
+在 **AstrBot 进程/容器** 设置环境变量 `PATH_CONVERT`：
+
+```yaml
+# AstrBot 的 compose 服务 environment 下；修改后需重新创建容器
+# 左边：AstrBot 看到的目录；右边：NapCat/协议端进程看到的目录
+# Linux 容器 -> Linux 协议端示例
+environment:
+  PATH_CONVERT: '/AstrBot/data=>/shared/astrbot-data'
+# Linux 容器 -> Windows 协议端则改成：
+#  PATH_CONVERT: '/AstrBot/data=>D:\astrbot\data'
+```
+
+多条映射用 `;` 分隔，匹配完整目录边界，最长匹配优先；Windows 源路径忽略大小写，Linux 源路径区分大小写。左右侧必须为绝对路径，路径本身不能包含作为配置分隔符的 `;` 或 `=>`。映射不会复制文件或创建挂载：右侧必须确实包含同一份音频，并可由协议端用户读取。协议端在容器里时，右侧应填它的容器内路径。环境变量只能保证转换规则明确，不能保证挂载与权限正确。
+
+没有共享目录时，可以使用 `load_mode=base64` 和 `send_mode=voice`（或 `voice_card`）：音频由 AstrBot 下载并编码为 `base64://...`，不依赖协议端操作系统或本地路径。base64 大小为 `4 * ceil(字节数 / 3)`，40 MiB 音频约产生 53.3 MiB 编码，另有 JSON 和内存开销；需确认协议端、WebSocket/代理消息大小限制，优先选择标准/较高音质。当前实现不会自动探测这些限制。
+
+`load_mode` 仅控制语音：**base64 模式下的文件发送及自动降级到文件仍需共享路径**。`url` 模式不下载本地音频，文件发送不可用；它让协议端直接下载音频 URL，不会携带插件侧 Cookie、自定义请求头或代理配置，协议端必须独立能访问该直链。没有共享目录且直链可访问时，URL 通常比 base64 更节省传输和内存。
 
 ## 数据目录与服务管理
 

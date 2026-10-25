@@ -8,6 +8,10 @@
 
 import asyncio
 import base64
+import ntpath
+import os
+import posixpath
+import urllib.parse
 from pathlib import Path
 
 from astrbot.api import logger
@@ -15,6 +19,77 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Plain, Record
 
 from .ncm_api import PlayInfo, Song
+
+
+def _windows_path(path: str) -> bool:
+    return bool(ntpath.splitdrive(path)[0]) or path.startswith("\\\\")
+
+
+def _absolute_path(path: str) -> bool:
+    if _windows_path(path):
+        drive, tail = ntpath.splitdrive(path)
+        return bool(drive) and (
+            drive.startswith(("\\\\", "//")) or tail.startswith(("/", "\\"))
+        )
+    return posixpath.isabs(path)
+
+
+def to_guest_path(path: str, guest_platform: str = "") -> str:
+    """用 PATH_CONVERT 的最长目录前缀映射到协议端路径；不猜测远端系统。
+
+    格式：源绝对目录=>目标绝对目录，多条以分号分隔。
+    auto 无映射时保留路径；windows/linux 仅校验结果路径类型。
+    映射不会共享文件，目标目录必须由协议端实际挂载并可读。
+    """
+    style = (guest_platform or "auto").strip().lower()
+    if style not in ("auto", "windows", "linux", "posix"):
+        raise ValueError("guest_path_style 必须为 auto/windows/linux")
+    if not _absolute_path(path):
+        raise ValueError("本地发送需要绝对路径")
+    source_module = ntpath if _windows_path(path) else posixpath
+    normalized = source_module.normpath(path)
+    comparable = source_module.normcase(normalized)
+    matches = []
+    for item in os.environ.get("PATH_CONVERT", "").split(";"):
+        if not item.strip():
+            continue
+        src, separator, dst = item.partition("=>")
+        src, dst = src.strip(), dst.strip()
+        if not separator or not _absolute_path(src) or not _absolute_path(dst):
+            raise ValueError("PATH_CONVERT 格式应为 源绝对目录=>目标绝对目录;...")
+        if _windows_path(src) != _windows_path(path):
+            continue
+        prefix = source_module.normcase(source_module.normpath(src))
+        boundary = (
+            prefix if prefix.endswith(source_module.sep) else prefix + source_module.sep
+        )
+        if comparable == prefix or comparable.startswith(boundary):
+            tail = normalized[len(prefix) :].lstrip(source_module.sep)
+            target_module = ntpath if _windows_path(dst) else posixpath
+            # POSIX 文件名中的反斜杠是字面字符，不应在 Linux 映射中改写。
+            parts = tail.split(source_module.sep) if tail else []
+            result = target_module.normpath(target_module.join(dst, *parts))
+            matches.append((len(prefix), result))
+    result = max(matches, key=lambda match: match[0])[1] if matches else path
+    if (style == "windows" and not _windows_path(result)) or (
+        style in ("linux", "posix") and _windows_path(result)
+    ):
+        raise ValueError(
+            "协议端路径类型不匹配，请设置 PATH_CONVERT 为协议端可读的实际目录"
+        )
+    return result
+
+
+def file_uri(path: str) -> str:
+    """按目标路径生成 URI，包括 Windows 盘符及 UNC 网络共享。"""
+    if not _absolute_path(path):
+        raise ValueError("file URI 需要绝对路径")
+    if _windows_path(path):
+        norm = ntpath.normpath(path).replace("\\", "/")
+        if norm.startswith("//"):
+            return "file:" + urllib.parse.quote(norm, safe="/:")
+        return "file:///" + urllib.parse.quote(norm, safe="/:")
+    return "file://" + urllib.parse.quote(posixpath.normpath(path), safe="/:")
 
 
 class SongSender:
@@ -66,7 +141,13 @@ class SongSender:
             else:  # file
                 if not audio_path:
                     raise RuntimeError("本地路径模式需要本地文件，但音频未下载")
-                file_field = Path(audio_path).resolve().as_uri()
+                # 路径按 OneBot 协议端所在系统换算，不能用本机 Path.as_uri()
+                guest = to_guest_path(
+                    str(Path(audio_path).resolve()),
+                    str(self.cfg.get("guest_path_style", "")),
+                )
+                file_field = file_uri(guest)
+                logger.debug(f"[ncm_player] 语音本地引用: {file_field}")
             seg = {"type": "record", "data": {"file": file_field}}
             await asyncio.wait_for(
                 self._bot_send(bot, event, [seg]), timeout=self.send_timeout
@@ -91,16 +172,20 @@ class SongSender:
         bot = self._raw_bot(event)
         filename = f"{song.name} - {song.artists}.{ext}"
         if bot is not None and hasattr(bot, "upload_private_file"):
+            guest = to_guest_path(
+                str(Path(audio_path).resolve()),
+                str(self.cfg.get("guest_path_style", "")),
+            )
             if self._is_group(event):
                 coro = bot.upload_group_file(
                     group_id=int(event.get_group_id()),
-                    file=str(Path(audio_path).resolve()),
+                    file=guest,
                     name=filename,
                 )
             else:
                 coro = bot.upload_private_file(
                     user_id=int(event.get_sender_id()),
-                    file=str(Path(audio_path).resolve()),
+                    file=guest,
                     name=filename,
                 )
             await asyncio.wait_for(coro, timeout=self.send_timeout)
