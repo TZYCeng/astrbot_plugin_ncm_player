@@ -57,8 +57,8 @@ def _mask_name(s: str) -> str:
 @register(
     "astrbot_plugin_ncm_player",
     "Kimi",
-    "网易云点歌：关键词监听/自然语言点歌、CD 风选歌图、语音/文件/卡片发送、热评卡片、歌词合并转发、扫码/短信验证码登录、内置 NeteaseCloudMusicApi 服务",
-    "1.5.0",
+    "网易云点歌：关键词/自然语言点歌、语音/文件/卡片发送、扫码/短信登录、内置 API、Docker/Linux/Windows 显式路径映射",
+    "1.5.1",
 )
 class NcmPlayerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):

@@ -2,7 +2,7 @@
 
 为 AstrBot 设计的网易云点歌插件。针对语音超时、音源回退和账号登录重新实现。
 
-[![Version](https://img.shields.io/badge/version-v1.5.0-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_ncm_player)
+[![Version](https://img.shields.io/badge/version-v1.5.1-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_ncm_player)
 [![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.9+-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
@@ -13,6 +13,10 @@
 - 内置 API、外部 API、网页音源、Meting 镜像和官方外链独立开关、多层回退。
 - 标准至母带逐级降质，显示实际返回音质，识别试听；下载失败继续尝试其他来源。
 - CD 风选歌/播放卡片、热评卡片和歌词合并转发。
+
+## v1.5.1 更新
+
+修复 Linux Docker 路径被错误转换为 Windows 的问题：默认保留原路径，通过 `PATH_CONVERT` 显式映射到协议端可读目录；语音和文件共用映射，并修正 file URI 编码。补充 base64/URL 的部署条件与限制。依赖旧版 `C:\AstrBot` 自动转换的部署需设置真实映射，详见下方 Docker 与跨系统发送说明及 [更新日志](CHANGELOG.md)。
 
 ## 安装与配置
 

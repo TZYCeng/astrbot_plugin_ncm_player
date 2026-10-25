@@ -214,5 +214,5 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(schema["ncm_api_external_enabled"]["default"])
         self.assertEqual(schema["ncm_api_github_accelerators"]["type"], "list")
         self.assertIn(
-            "version: v1.5.0", (root / "metadata.yaml").read_text(encoding="utf-8")
+            "version: v1.5.1", (root / "metadata.yaml").read_text(encoding="utf-8")
         )
