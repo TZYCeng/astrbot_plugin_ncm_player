@@ -1,6 +1,6 @@
 # 网易云点歌插件 · 开发交接文档
 
-> 仓库：`astrbot_plugin_ncm_player`（AstrBot 插件，MIT）
+> 本文是旧仓库的历史交接。v1.5.2 是旧仓库最后一个迁移过渡版；后续维护和寒假重构迁往 [astrbot_plugin_tzyc_music](https://github.com/TZYCeng/astrbot_plugin_tzyc_music)，问题请到[新仓库 Issues](https://github.com/TZYCeng/astrbot_plugin_tzyc_music/issues)。以下版本与行号对应历史快照。
 > 交接对象：后续接手维护/二次开发的开发者
 > 文档基于代码快照：`5811d6a fix: repair login and add resilient API lifecycle (v1.5.0)`（2026-10-09）
 > 文档编写日期：2026-10-25

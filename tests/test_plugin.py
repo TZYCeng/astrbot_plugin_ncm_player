@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import json
 import tempfile
@@ -213,6 +214,32 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(schema["ncm_web_cookie_enabled"]["default"])
         self.assertTrue(schema["ncm_api_external_enabled"]["default"])
         self.assertEqual(schema["ncm_api_github_accelerators"]["type"], "list")
-        self.assertIn(
-            "version: v1.5.1", (root / "metadata.yaml").read_text(encoding="utf-8")
+        metadata = dict(
+            line.split(": ", 1)
+            for line in (root / "metadata.yaml")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.startswith(("name: ", "version: ", "repo: "))
+        )
+        module = ast.parse((root / "main.py").read_text(encoding="utf-8"))
+        plugin = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "NcmPlayerPlugin"
+        )
+        registration = next(
+            decorator
+            for decorator in plugin.decorator_list
+            if isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Name)
+            and decorator.func.id == "register"
+        )
+        self.assertEqual(metadata["name"], ast.literal_eval(registration.args[0]))
+        self.assertEqual(
+            metadata["version"].removeprefix("v"),
+            ast.literal_eval(registration.args[3]),
+        )
+        self.assertEqual(metadata["name"], "astrbot_plugin_ncm_player")
+        self.assertEqual(
+            metadata["repo"], "https://github.com/TZYCeng/astrbot_plugin_tzyc_music"
         )

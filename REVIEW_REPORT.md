@@ -1,5 +1,7 @@
 # 跨系统发送修复与全代码审查（2026-10-25）
 
+> 旧仓库归档前的历史快照。后续修复和寒假重构转至 [astrbot_plugin_tzyc_music](https://github.com/TZYCeng/astrbot_plugin_tzyc_music)；问题可先提交到[新仓库 Issues](https://github.com/TZYCeng/astrbot_plugin_tzyc_music/issues)。
+
 ## 范围与结论
 
 已修复本次授权的路径转换问题；其他发现均未实施，等待按编号确认。完整阅读生产模块 main、auth、ncm_api、ncm_server、renderer、sender，测试模块与配置/README/CHANGELOG/HANDOFF。交接文档是旧快照，不能代替当前源码证据。审查不能保证穷尽全部运行期问题。

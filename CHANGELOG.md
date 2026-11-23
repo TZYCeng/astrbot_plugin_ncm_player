@@ -1,5 +1,11 @@
 # 更新日志 (CHANGELOG)
 
+## [v1.5.2] - 2026-11-23 - 旧仓库最后一个迁移过渡版
+
+- 后续维护迁往 [TZYCeng/astrbot_plugin_tzyc_music](https://github.com/TZYCeng/astrbot_plugin_tzyc_music)。为避免与同名点歌插件混淆而更换仓库；因学业繁忙，近期暂停功能更新和日常维护。
+- 本次只更新版本、仓库入口与迁移说明，保留 v1.5.1 的功能、原插件标识、配置和数据目录。重构尚未开始。
+- 问题可先提交到[新仓库 Issues](https://github.com/TZYCeng/astrbot_plugin_tzyc_music/issues)。预计 2026–2027 学年寒假启动重构，计划接入更多音乐源、扩充自部署内容、支持点歌菜单自定义。本仓库归档后只读。
+
 ## [v1.5.1] - 2026-10-25 - 修复 Docker 跨系统路径转换
 
 * **Linux Docker 路径修复**：`guest_path_style=auto` 不再将 POSIX 绝对路径推断成 Windows；未配置映射时保留原路径，避免错误生成 `C:\AstrBot\...`。

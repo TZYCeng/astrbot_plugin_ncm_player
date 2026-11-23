@@ -2,10 +2,16 @@
 
 为 AstrBot 设计的网易云点歌插件。针对语音超时、音源回退和账号登录重新实现。
 
-[![Version](https://img.shields.io/badge/version-v1.5.1-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_ncm_player)
+[![Version](https://img.shields.io/badge/version-v1.5.2-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_tzyc_music/releases/tag/v1.5.2)
 [![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.9+-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+
+> **本仓库已迁移，旧仓库归档后只读。** 请前往 [新仓库 `TZYCeng/astrbot_plugin_tzyc_music`](https://github.com/TZYCeng/astrbot_plugin_tzyc_music) 获取可用版本和后续更新。更换仓库名是为了与其他同名点歌插件区分；近期因学业繁忙，暂时无法持续更新维护。
+>
+> **现有功能不受迁移影响。** v1.5.2 是迁移过渡版，不是空壳，也不是重构版；保留原 AstrBot 插件标识、配置和数据目录。不要同时安装旧、新两份，也不要为了迁移卸载并清空配置。
+>
+> 遇到问题请先到[新仓库 Issues](https://github.com/TZYCeng/astrbot_plugin_tzyc_music/issues)提交，可能晚些回复。计划在 2026–2027 学年寒假启动重构，接入更多音乐源、补充自部署内容，并支持点歌菜单自定义；这些功能尚未上线。
 
 - 自然语言 LLM 工具与关键词监听点歌，选歌按会话和用户隔离。
 - 语音、文件、音乐卡片及组合发送；支持本地路径、URL、base64 载入。
